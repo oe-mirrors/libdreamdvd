@@ -2297,6 +2297,8 @@ send_message:
 					case DDVD_SKIP_BWD:
 					case DDVD_SET_TITLE:
 					case DDVD_SET_CHAPTER:
+					case DDVD_SET_AUDIO:
+					case DDVD_SET_SUBTITLE:
 						// we must empty the pipe here... and fall through
 						ddvd_readpipe(key_pipe, &keydone, sizeof(int), 1);
 					default:
@@ -2346,6 +2348,8 @@ send_message:
 					case DDVD_SKIP_BWD:
 					case DDVD_SET_TITLE:
 					case DDVD_SET_CHAPTER:
+					case DDVD_SET_AUDIO:
+					case DDVD_SET_SUBTITLE:
 						// we must empty the pipe here...
 						ddvd_readpipe(key_pipe, &keydone, sizeof(int), 1);
 					default:
