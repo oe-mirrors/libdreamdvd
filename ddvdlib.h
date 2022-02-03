@@ -163,13 +163,13 @@ void ddvd_get_last_audio(struct ddvd*pconfig, int *id, int16_t *lang, int *type)
 void ddvd_get_audio_byid(struct ddvd *pconfig, int audio_id, int16_t *lang, int *type);
 
 // get the number of available audio tracks
-void ddvd_get_audio_count(struct ddvd *pconfig, void *count);
+void ddvd_get_audio_count(struct ddvd *pconfig, int *count);
 
 // get the active subtitle track
 // int id -> logical track number
 // uint16_t lang -> subtitle language in 2 letter iso code
 // id=-1 means no subtitle track active
-void ddvd_get_last_spu(struct ddvd*pconfig, void *id, int16_t *lang);
+void ddvd_get_last_spu(struct ddvd*pconfig, int *id, int16_t *lang);
 
 // get track details for given subtitle track id
 void ddvd_get_spu_byid(struct ddvd *pconfig, int spu_id, int16_t *lang);
