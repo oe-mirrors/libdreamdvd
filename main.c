@@ -2728,9 +2728,12 @@ err_dvdnav:
 		Debug(1, "Error on dvdnav_close: %s\n", dvdnav_err_to_string(dvdnav));
 
 err_dvdnav_open:
-	ddvd_device_clear();
+	if (ioctl(ddvd_fdvideo, VIDEO_STOP) < 0)
+		Perror("VIDEO_STOP");
 	if (ioctl(ddvd_fdvideo, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_DEMUX) < 0)
 		Perror("VIDEO_SELECT_SOURCE");
+	if (ioctl(ddvd_fdvideo, AUDIO_STOP) < 0)
+		Perror("VIDEO_STOP");
 	if (ioctl(ddvd_fdaudio, AUDIO_SELECT_SOURCE, AUDIO_SOURCE_DEMUX) < 0)
 		Perror("AUDIO_SELECT_SOURCE");
 	close(ddvd_ac3_fd);
