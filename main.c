@@ -2164,7 +2164,7 @@ send_message:
 			int resized = 0;
 
 			if ((x_offset != 0 || y_offset != 0 || y_source != ddvd_screeninfo_yres ||
-				ddvd_screeninfo_xres != 720) && !playerconfig->canscale) {
+				ddvd_screeninfo_xres != 720) && (!playerconfig->canscale || ddvd_have_ntsc == 1)) {
 				// decide which resize routine we should use
 				// on 4bpp mode we use bicubic resize for sd skins because we get much better results
 				// with subtitles and the speed is ok for hd skins we use nearest neighbor resize because
