@@ -413,7 +413,7 @@ void ddvd_get_last_string(struct ddvd *pconfig, void *text)
 }
 
 // get the number of available audio tracks
-void ddvd_get_audio_count(struct ddvd *pconfig, void *count)
+void ddvd_get_audio_count(struct ddvd *pconfig, int *count)
 {
 	int c = 0;
 	int i;
@@ -425,7 +425,7 @@ void ddvd_get_audio_count(struct ddvd *pconfig, void *count)
 }
 
 // get the active audio track
-void ddvd_get_last_audio(struct ddvd *pconfig, void *id, void *lang, void *type)
+void ddvd_get_last_audio(struct ddvd *pconfig, int *id, int16_t *lang, int *type)
 {
 	memcpy(id, &pconfig->last_audio_id, sizeof(pconfig->last_audio_id));
 	memcpy(lang, &pconfig->last_audio_lang, sizeof(pconfig->last_audio_lang));
@@ -434,7 +434,7 @@ void ddvd_get_last_audio(struct ddvd *pconfig, void *id, void *lang, void *type)
 }
 
 // get audio track details for given audio track id
-void ddvd_get_audio_byid(struct ddvd *pconfig, int audio_id, void *lang, void *type)
+void ddvd_get_audio_byid(struct ddvd *pconfig, int audio_id, int16_t *lang, int *type)
 {
 	int audio_id_logical;
 	uint16_t audio_lang = 0xFFFF;
@@ -448,7 +448,7 @@ void ddvd_get_audio_byid(struct ddvd *pconfig, int audio_id, void *lang, void *t
 }
 
 // get the active SPU track
-void ddvd_get_last_spu(struct ddvd *pconfig, void *id, void *lang)
+void ddvd_get_last_spu(struct ddvd *pconfig, int *id, int16_t *lang)
 {
 	memcpy(id, &pconfig->last_spu_id, sizeof(pconfig->last_spu_id));
 	memcpy(lang, &pconfig->last_spu_lang, sizeof(pconfig->last_spu_lang));
@@ -456,7 +456,7 @@ void ddvd_get_last_spu(struct ddvd *pconfig, void *id, void *lang)
 }
 
 // get the number of available subtitle tracks
-void ddvd_get_spu_count(struct ddvd *pconfig, void *count)
+void ddvd_get_spu_count(struct ddvd *pconfig, int *count)
 {
 	int c = 0;
 	int i;
@@ -469,7 +469,7 @@ void ddvd_get_spu_count(struct ddvd *pconfig, void *count)
 }
 
 // get language details for given subtitle track id
-void ddvd_get_spu_byid(struct ddvd *pconfig, int spu_id, void *lang)
+void ddvd_get_spu_byid(struct ddvd *pconfig, int spu_id, int16_t *lang)
 {
 	uint16_t spu_lang = 0xFFFF;
 	if (spu_id < MAX_SPU && pconfig->spu_map[spu_id].logical_id > -1)

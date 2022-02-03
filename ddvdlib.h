@@ -157,10 +157,10 @@ void ddvd_get_last_string(struct ddvd*pconfig, void *text);
 // int id -> logical track number
 // uint16_t lang -> audio language in 2 letter iso code
 // int type -> audio type, see audio type enum (ac3,mpeg,...)
-void ddvd_get_last_audio(struct ddvd*pconfig, void *id, void *lang, void *type);
+void ddvd_get_last_audio(struct ddvd*pconfig, int *id, int16_t *lang, int *type);
 
 // get audio track details for given audio track id
-void ddvd_get_audio_byid(struct ddvd *pconfig, int audio_id, void *lang, void *type);
+void ddvd_get_audio_byid(struct ddvd *pconfig, int audio_id, int16_t *lang, int *type);
 
 // get the number of available audio tracks
 void ddvd_get_audio_count(struct ddvd *pconfig, void *count);
@@ -169,13 +169,17 @@ void ddvd_get_audio_count(struct ddvd *pconfig, void *count);
 // int id -> logical track number
 // uint16_t lang -> subtitle language in 2 letter iso code
 // id=-1 means no subtitle track active
-void ddvd_get_last_spu(struct ddvd*pconfig, void *id, void *lang);
+void ddvd_get_last_spu(struct ddvd*pconfig, void *id, int16_t *lang);
 
 // get track details for given subtitle track id
-void ddvd_get_spu_byid(struct ddvd *pconfig, int spu_id, void *lang);
+void ddvd_get_spu_byid(struct ddvd *pconfig, int spu_id, int16_t *lang);
+
+#define DDVD_SUPPORTS_TRACK_FLAGS 1
+// get track filter and flags for given subtitle track id
+void ddvd_get_spu_filter_flags_byid(struct ddvd *pconfig, int spu_id, int8_t *filter, int8_t *trackflags);
 
 // get the number of available subtitle tracks
-void ddvd_get_spu_count(struct ddvd *pconfig, void *count);
+void ddvd_get_spu_count(struct ddvd *pconfig, int *count);
 
 // get dvd title string
 void ddvd_get_title_string(struct ddvd*pconfig, char *title_string);
