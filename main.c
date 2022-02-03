@@ -32,6 +32,13 @@
 #include "string.h"
 #include "errno.h"
 
+#if !defined(DVDNAV_FORMAT_AC3)
+#define DVDNAV_FORMAT_AC3	DVD_AUDIO_FORMAT_AC3
+#define DVDNAV_FORMAT_MPEGAUDIO	DVD_AUDIO_FORMAT_MPEG2_EXT
+#define DVDNAV_FORMAT_LPCM	DVD_AUDIO_FORMAT_LPCM
+#define DVDNAV_FORMAT_DTS	DVD_AUDIO_FORMAT_DTS
+#endif
+
 #define Debug(level, str, ...) (DebugLevel > level ? printf("LIBDVD: %07.3f: " str, (float) ddvd_get_time() / 1000.0, ##__VA_ARGS__) : 0)
 #define Perror(msg)            Debug(-1, "%s: %s", msg, strerror(errno))
 
