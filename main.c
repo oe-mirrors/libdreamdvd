@@ -597,6 +597,11 @@ static int readApiSize(int fd, int *xres, int *yres, int *aspect)
 	return -1;
 }
 
+/* The definition of VIDEO_GET_FRAME_RATE was removed in 4.18 */
+#ifndef VIDEO_GET_FRAME_RATE
+#define VIDEO_GET_FRAME_RATE       _IOR('o', 56, unsigned int)
+#endif
+
 static int readApiFrameRate(int fd, int *framerate)
 {
 	unsigned int frate;
