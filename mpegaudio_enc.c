@@ -330,7 +330,14 @@ static void ddvd_mpa_compute_scale_factors(unsigned char ddvd_mpa_scale_code[SBL
                    use at most 2 compares to find the index */
                 index = (21 - n) * 3 - 3;
                 if (index >= 0) {
-                    while (vmax <= ddvd_mpa_scale_factor_table[index+1])
+                    /* bound the loop: index+1 must stay within the
+                       64-entry table. On some hardware (Hisilicon
+                       boxes w/ missing STC/sync drivers) vmax can
+                       end up smaller than every remaining table
+                       entry, overrunning the array and tripping the
+                       assert below with SIGABRT. */
+                    while (index < 62 &&
+                           vmax <= ddvd_mpa_scale_factor_table[index+1])
                         index++;
                 } else {
                     index = 0; /* very unlikely case of overflow */
@@ -338,6 +345,8 @@ static void ddvd_mpa_compute_scale_factors(unsigned char ddvd_mpa_scale_code[SBL
             } else {
                 index = 62; /* value 63 is not allowed */
             }
+            if (index > 62)
+                index = 62; /* value 63 is not allowed */
 
 #if 0
             printf("%2d:%d in=%x %x %d\n",
