@@ -3,8 +3,8 @@ AM_CFLAGS = @DVDNAV_CFLAGS@
 lib_LTLIBRARIES = libdreamdvd.la
 
 libdreamdvd_la_SOURCES = \
-	a52_dec.c \
-	a52dec.h \
+	dreamalsa.c \
+	dreamalsa.h \
 	logo.h \
 	main.c \
 	main.h \

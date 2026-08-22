@@ -221,7 +221,6 @@ struct ddvd {
 	int tv_mode;					// 0-> letterbox 1-> pan_scan 2-> justscale
 	int tv_mode2;					// 0-> letterbox 1-> pan_scan 2-> justscale
 	int tv_system;					// 0-> PAL 1-> NTSC
-	int ac3thru;					// 0-> internal soft decoding 1-> ac3 pass thru to optical out
 	unsigned char *lfb;				// framebuffer to render subtitles and menus
 	int xres;						// x resolution of the framebuffer (normally 720, we dont scale inside libdreamdvd)
 	int yres;						// y resolution of the framebuffer (normally 576, we dont scale inside libdreamdvd)

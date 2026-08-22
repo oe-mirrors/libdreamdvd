@@ -54,7 +54,7 @@ enum ddvd_result {
  * functions for initialization and setting options DONT USE THIS FUNCTIONS AFTER STARTING WITH ddvd_run !!!
  */
 
-// create a ddvd handle with default options PAL, 4:3 LB, EN, AC3 decoding internal (if liba52 is available)
+// create a ddvd handle with default options PAL, 4:3 LB and EN
 struct ddvd *ddvd_create(void);
 
 // get message_pipe fd to make polling possible
@@ -76,9 +76,7 @@ void ddvd_set_dvd_path(struct ddvd *pconfig, const char *path);
 // set preferred dvd language in 2 letter iso code (en,de, ...)
 void ddvd_set_language(struct ddvd *pconfig, const char lang[2]);
 
-// set external/internal AC3 decoding 0-> external 1-> internal
-// internal decoding needs liba52 which will be loaded dynamically if available
-// if set to "internal" and liba52 will not be found, the AC3 data will be passed thru 
+// retained for ABI compatibility; AC3 is handled by the platform decoder
 void ddvd_set_ac3thru(struct ddvd *pconfig, int ac3thru);
 
 // set video options for aspect and the tv system, see enums for possible options

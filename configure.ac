@@ -24,7 +24,6 @@ AC_SUBST(LIBM_LIBS)
 
 # Checks for header files.
 AC_CHECK_HEADERS([byteswap.h ost/dmx.h linux/dvb/version.h])
-AC_CHECK_HEADER([a52dec/a52.h], [], [AC_MSG_ERROR([Could not find liba52 development headers])])
 
 AC_CONFIG_FILES([
 Makefile

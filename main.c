@@ -30,12 +30,12 @@
 
 #include "main.h"
 #include "mpegaudioenc.h"
-#include "a52dec.h"
+#include "dreamalsa.h"
 #include "string.h"
 #include "errno.h"
 
 #define Debug(level, str, ...) (DebugLevel > level ? printf("LIBDVD: %07.3f: " str, (float) ddvd_get_time() / 1000.0, ##__VA_ARGS__) : 0)
-#define Perror(msg)            Debug(-1, "%s: %s", msg, strerror(errno))
+#define Perror(msg)            Debug(-1, "%s: %s\n", msg, strerror(errno))
 
 int DebugLevel = 1;
 
@@ -115,7 +115,833 @@ static int write_string(const char *filename, const char *string)
 	return 0;
 }
 
+#if defined(__aarch64__)
+
+/*
+ * Dreambox One/Two use a private Amlogic frame injection ABI.  Their DVB
+ * video device accepts the regular control ioctls, but a PES write(2) is not
+ * the input path and fails with EBUSY/EINVAL.  The ABI below is also used by
+ * Dream's video sink and is intentionally enabled only for the two known
+ * Dreambox models.
+ */
+#define DDVD_DREAM_AML_POLL_DEVICE       "/dev/amvideo_poll"
+#define DDVD_DREAM_AML_VFM_MAP           "/sys/class/vfm/map"
+#define DDVD_DREAM_AML_DISABLE_VIDEO     "/sys/class/video/disable_video"
+#define DDVD_DREAM_AML_FREERUN_MODE      "/sys/class/video/freerun_mode"
+#define DDVD_DREAM_AML_TSYNC_ENABLE      "/sys/class/tsync/enable"
+#define DDVD_DREAM_DEFAULT_FRAME_PTS      UINT64_C(3600)
+#define DDVD_DREAM_PACING_LEAD_MS        UINT64_C(600)
+#define DDVD_DREAM_BACKPRESSURE_MS        500
+#define DDVD_DREAM_MPEG2_PACKET_MAX_SIZE (2 * 1024 * 1024)
+
+struct ddvd_dream_video_frame {
+	uint64_t pts;
+	ssize_t bytes[8];
+	const uint8_t *data[8];
+	int is_phys_addr[8];
+};
+
+struct ddvd_dream_video_dec_sysinfo {
+	uint32_t format;
+	uint32_t width;
+	uint32_t height;
+	uint32_t rate;
+	uint32_t extra;
+	uint32_t status;
+	uint32_t ratio;
+	uint32_t padding;
+	uint64_t ratio64;
+	void *param;
+};
+
+typedef char ddvd_dream_video_frame_size_check[
+	sizeof(struct ddvd_dream_video_frame) == 0xa8 ? 1 : -1];
+typedef char ddvd_dream_video_sysinfo_size_check[
+	sizeof(struct ddvd_dream_video_dec_sysinfo) == 0x30 ? 1 : -1];
+
+#define DDVD_DREAM_VIDEO_SET_FRAME \
+	_IOWR('o', 64, struct ddvd_dream_video_frame)
+#define DDVD_DREAM_VIDEO_SET_DEC_SYSINFO \
+	_IOWR('o', 65, struct ddvd_dream_video_dec_sysinfo)
+
+static int ddvd_dream_aml_active;
+static int ddvd_dream_aml_decoder_started;
+static int ddvd_dream_aml_poll_fd = -1;
+static int ddvd_dream_aml_video_visible;
+static int ddvd_dream_aml_av_clock;
+static int ddvd_dream_aml_saved_disable_video;
+static int ddvd_dream_aml_saved_freerun_mode;
+static int ddvd_dream_aml_saved_tsync_enable;
+static int ddvd_dream_aml_restore_disable_video;
+static int ddvd_dream_aml_restore_freerun_mode;
+static int ddvd_dream_aml_restore_tsync_enable;
+static int ddvd_dream_aml_backpressure_logged;
+static uint8_t *ddvd_dream_aml_packet_data;
+static size_t ddvd_dream_aml_packet_size;
+static size_t ddvd_dream_aml_packet_capacity;
+static uint64_t ddvd_dream_aml_output_pts;
+static uint64_t ddvd_dream_aml_frame_pts_step;
+static int ddvd_dream_aml_pacing_valid;
+static uint64_t ddvd_dream_aml_pacing_pts;
+static uint64_t ddvd_dream_aml_pacing_time;
+
+static int ddvd_write_number(const char *filename, int value);
+
+static void ddvd_dream_aml_reset_packet(void)
+{
+	ddvd_dream_aml_packet_size = 0;
+}
+
+static void ddvd_dream_aml_free_packet(void)
+{
+	free(ddvd_dream_aml_packet_data);
+	ddvd_dream_aml_packet_data = NULL;
+	ddvd_dream_aml_packet_capacity = 0;
+	ddvd_dream_aml_reset_packet();
+}
+
+static int ddvd_dream_aml_reserve_packet(size_t size)
+{
+	size_t capacity;
+	uint8_t *data;
+
+	if (size > DDVD_DREAM_MPEG2_PACKET_MAX_SIZE)
+		return -1;
+	if (size <= ddvd_dream_aml_packet_capacity)
+		return 0;
+
+	capacity = ddvd_dream_aml_packet_capacity ?
+		ddvd_dream_aml_packet_capacity : 128 * 1024;
+	while (capacity < size) {
+		capacity *= 2;
+		if (capacity > DDVD_DREAM_MPEG2_PACKET_MAX_SIZE) {
+			capacity = DDVD_DREAM_MPEG2_PACKET_MAX_SIZE;
+			break;
+		}
+	}
+
+	data = realloc(ddvd_dream_aml_packet_data, capacity);
+	if (data == NULL)
+		return -1;
+	ddvd_dream_aml_packet_data = data;
+	ddvd_dream_aml_packet_capacity = capacity;
+	return 0;
+}
+
+static void ddvd_dream_aml_reset_pacing(void)
+{
+	ddvd_dream_aml_pacing_valid = 0;
+}
+
+static void ddvd_dream_aml_reset_timeline(void)
+{
+	/* Parts of the Amlogic driver use zero as "timestamp unavailable". */
+	ddvd_dream_aml_output_pts = 90000;
+	ddvd_dream_aml_frame_pts_step = DDVD_DREAM_DEFAULT_FRAME_PTS;
+	ddvd_dream_aml_reset_pacing();
+}
+
+static void ddvd_dream_aml_pace(uint64_t pts)
+{
+	uint64_t target;
+	uint64_t now;
+
+	if (!ddvd_dream_aml_pacing_valid || pts < ddvd_dream_aml_pacing_pts) {
+		ddvd_dream_aml_pacing_valid = 1;
+		ddvd_dream_aml_pacing_pts = pts;
+		ddvd_dream_aml_pacing_time = ddvd_get_time();
+		return;
+	}
+
+	target = ddvd_dream_aml_pacing_time +
+		(pts - ddvd_dream_aml_pacing_pts) / 90;
+	for (;;) {
+		uint64_t wait_ms;
+
+		now = ddvd_get_time();
+		if (target <= now + DDVD_DREAM_PACING_LEAD_MS)
+			break;
+		wait_ms = target - now - DDVD_DREAM_PACING_LEAD_MS;
+		/* Recompute after short sleeps.  This keeps menu/navigation input
+		 * responsive and avoids the accumulated-lead bug of the first pacer. */
+		if (wait_ms > 20)
+			wait_ms = 20;
+		usleep((useconds_t)wait_ms * 1000);
+	}
+}
+
+static uint64_t ddvd_dream_aml_logical_pts(uint64_t dvd_pts,
+	uint64_t decoder_pts)
+{
+	uint64_t queued_pts;
+
+	if (!ddvd_dream_aml_active || dvd_pts == 0)
+		return decoder_pts;
+
+	/* The decoder runs on the private continuous timeline while SPU/button and
+	 * dvdnav logic still use the original DVD clock.  Translate the displayed
+	 * position by subtracting the number of frames currently queued ahead. */
+	if (ddvd_dream_aml_output_pts >= decoder_pts) {
+		queued_pts = ddvd_dream_aml_output_pts - decoder_pts;
+		if (queued_pts <= 2 * 90000 && dvd_pts >= queued_pts)
+			return dvd_pts - queued_pts;
+	}
+	return dvd_pts;
+}
+
+static void ddvd_dream_aml_resume_clock(void)
+{
+	if (!ddvd_dream_aml_active)
+		return;
+
+	/* PCM is rendered by the separate ALSA device and therefore cannot
+	 * provide the vendor DVB decoder with an APTS clock.  Keep video in
+	 * freerun mode and let the interleaved DVD PTS pacing above be the clock. */
+	if (ddvd_write_number(DDVD_DREAM_AML_TSYNC_ENABLE, 0) < 0)
+		Perror(DDVD_DREAM_AML_TSYNC_ENABLE);
+	if (ddvd_write_number(DDVD_DREAM_AML_FREERUN_MODE, 1) < 0)
+		Perror(DDVD_DREAM_AML_FREERUN_MODE);
+	ddvd_dream_aml_av_clock = 0;
+	ddvd_dream_aml_reset_pacing();
+	ddvd_dream_aml_backpressure_logged = 0;
+}
+
+static int ddvd_read_number(const char *filename, int *value)
+{
+	char text[64];
+	char *end;
+	long parsed;
+
+	if (read_string(filename, text, sizeof(text)) < 0)
+		return -1;
+
+	errno = 0;
+	parsed = strtol(text, &end, 10);
+	if (errno != 0 || end == text)
+		return -1;
+	*value = (int)parsed;
+	return 0;
+}
+
+static int ddvd_write_number(const char *filename, int value)
+{
+	char text[32];
+
+	if (snprintf(text, sizeof(text), "%d", value) <= 0)
+		return -1;
+	return write_string(filename, text);
+}
+
+static void ddvd_dream_aml_set_vfm_route(void)
+{
+	if (write_string(DDVD_DREAM_AML_VFM_MAP, "rm default") < 0)
+		return;
+	write_string(DDVD_DREAM_AML_VFM_MAP,
+		"add default decoder ppmgr deinterlace amvideo");
+}
+
+static int ddvd_is_dream_aml(void)
+{
+	char model[32];
+
+	if (access(DDVD_DREAM_AML_POLL_DEVICE, R_OK | W_OK) < 0 ||
+		read_string("/proc/stb/info/model", model, sizeof(model)) < 0)
+		return 0;
+
+	return !strcmp(model, "one") || !strcmp(model, "two");
+}
+
+static void ddvd_dream_aml_restore(void)
+{
+	ddvd_dream_alsa_close();
+	ddvd_dream_aml_free_packet();
+
+	if (ddvd_dream_aml_poll_fd >= 0) {
+		close(ddvd_dream_aml_poll_fd);
+		ddvd_dream_aml_poll_fd = -1;
+	}
+
+	if (!ddvd_dream_aml_active)
+		return;
+
+	ddvd_dream_aml_set_vfm_route();
+	if (ddvd_dream_aml_restore_freerun_mode)
+		ddvd_write_number(DDVD_DREAM_AML_FREERUN_MODE,
+			ddvd_dream_aml_saved_freerun_mode);
+	if (ddvd_dream_aml_restore_tsync_enable)
+		ddvd_write_number(DDVD_DREAM_AML_TSYNC_ENABLE,
+			ddvd_dream_aml_saved_tsync_enable);
+	if (ddvd_dream_aml_restore_disable_video)
+		ddvd_write_number(DDVD_DREAM_AML_DISABLE_VIDEO,
+			ddvd_dream_aml_saved_disable_video);
+
+	ddvd_dream_aml_active = 0;
+	ddvd_dream_aml_decoder_started = 0;
+	ddvd_dream_aml_video_visible = 0;
+	ddvd_dream_aml_av_clock = 0;
+	ddvd_dream_aml_reset_timeline();
+}
+
+static int ddvd_dream_aml_prepare(void)
+{
+	ddvd_dream_aml_reset_packet();
+	ddvd_dream_aml_active = 0;
+	ddvd_dream_aml_decoder_started = 0;
+	ddvd_dream_aml_video_visible = 0;
+	ddvd_dream_aml_av_clock = 0;
+	ddvd_dream_aml_reset_timeline();
+	ddvd_dream_aml_restore_disable_video = 0;
+	ddvd_dream_aml_restore_freerun_mode = 0;
+	ddvd_dream_aml_restore_tsync_enable = 0;
+
+	if (!ddvd_is_dream_aml())
+		return 0;
+
+	ddvd_dream_aml_poll_fd = open(DDVD_DREAM_AML_POLL_DEVICE,
+		O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	if (ddvd_dream_aml_poll_fd < 0) {
+		Perror(DDVD_DREAM_AML_POLL_DEVICE);
+		return -1;
+	}
+
+	ddvd_dream_aml_restore_disable_video =
+		ddvd_read_number(DDVD_DREAM_AML_DISABLE_VIDEO,
+			&ddvd_dream_aml_saved_disable_video) == 0;
+	ddvd_dream_aml_restore_freerun_mode =
+		ddvd_read_number(DDVD_DREAM_AML_FREERUN_MODE,
+			&ddvd_dream_aml_saved_freerun_mode) == 0;
+	ddvd_dream_aml_restore_tsync_enable =
+		ddvd_read_number(DDVD_DREAM_AML_TSYNC_ENABLE,
+			&ddvd_dream_aml_saved_tsync_enable) == 0;
+
+	if (!ddvd_dream_aml_restore_disable_video ||
+		!ddvd_dream_aml_restore_freerun_mode ||
+		!ddvd_dream_aml_restore_tsync_enable) {
+		Debug(0, "Dream Amlogic decoder state is not readable\n");
+		close(ddvd_dream_aml_poll_fd);
+		ddvd_dream_aml_poll_fd = -1;
+		return -1;
+	}
+
+	ddvd_dream_aml_active = 1;
+	ddvd_dream_aml_set_vfm_route();
+	if (ddvd_write_number(DDVD_DREAM_AML_DISABLE_VIDEO, 1) < 0 ||
+		ddvd_write_number(DDVD_DREAM_AML_TSYNC_ENABLE, 0) < 0 ||
+		ddvd_write_number(DDVD_DREAM_AML_FREERUN_MODE, 1) < 0) {
+		Debug(0, "Could not configure Dream Amlogic decoder state\n");
+		ddvd_dream_aml_restore();
+		return -1;
+	}
+
+	Debug(0, "Using Dream One/Two Amlogic frame output\n");
+	return 1;
+}
+
+static const uint8_t *ddvd_find_mpeg_start_code(const uint8_t *data,
+	size_t size, uint8_t code)
+{
+	size_t i;
+
+	for (i = 0; i + 3 < size; ++i) {
+		if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+			data[i + 2] == 0x01 && data[i + 3] == code)
+			return data + i;
+	}
+	return NULL;
+}
+
+static const uint8_t *ddvd_find_mpeg_sequence_header(const uint8_t *data,
+	size_t size)
+{
+	const uint8_t *sequence = ddvd_find_mpeg_start_code(data, size, 0xb3);
+
+	return sequence != NULL && size - (size_t)(sequence - data) >= 8 ?
+		sequence : NULL;
+}
+
+static size_t ddvd_find_mpeg_picture_start(const uint8_t *data, size_t size,
+	size_t offset)
+{
+	size_t i;
+
+	for (i = offset; i + 3 < size; ++i) {
+		if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+			data[i + 2] == 0x01 && data[i + 3] == 0x00)
+			return i;
+	}
+	return SIZE_MAX;
+}
+
+static uint32_t ddvd_dream_aml_frame_duration(uint8_t frame_rate_code)
+{
+	static const uint32_t durations[] = {
+		3203, 4004, 4000, 3840, 3203, 3200, 1920, 1601, 1600
+	};
+
+	return frame_rate_code < sizeof(durations) / sizeof(durations[0]) ?
+		durations[frame_rate_code] : durations[0];
+}
+
+static uint64_t ddvd_dream_aml_frame_pts_duration(uint8_t frame_rate_code)
+{
+	/* 90 kHz picture durations for the MPEG-2 frame_rate_code values.  The
+	 * fractional NTSC rates are rounded on alternate pictures by the decoder;
+	 * DVD PAL uses the exact 3600-tick entry. */
+	static const uint16_t durations[] = {
+		3003, 3754, 3750, 3600, 3003, 3000, 1800, 1502, 1500
+	};
+
+	return frame_rate_code < sizeof(durations) / sizeof(durations[0]) ?
+		durations[frame_rate_code] : DDVD_DREAM_DEFAULT_FRAME_PTS;
+}
+
+static int ddvd_dream_aml_start_decoder(const uint8_t *data, size_t size)
+{
+	struct ddvd_dream_video_dec_sysinfo sysinfo;
+	const uint8_t *sequence = ddvd_find_mpeg_sequence_header(data, size);
+
+	memset(&sysinfo, 0, sizeof(sysinfo));
+	sysinfo.format = 0; /* MPEG-1/2 */
+	sysinfo.width = 720;
+	sysinfo.height = 576;
+	sysinfo.rate = 3203;
+	if (sequence != NULL) {
+		sysinfo.width = (sequence[4] << 4) | (sequence[5] >> 4);
+		sysinfo.height = ((sequence[5] & 0x0f) << 8) | sequence[6];
+		sysinfo.rate = ddvd_dream_aml_frame_duration(sequence[7] & 0x0f);
+	}
+
+	if (ioctl(ddvd_fdvideo, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_MEMORY) < 0 ||
+		ioctl(ddvd_fdvideo, VIDEO_FREEZE, 0) < 0 ||
+		ioctl(ddvd_fdvideo, DDVD_DREAM_VIDEO_SET_DEC_SYSINFO, &sysinfo) < 0 ||
+		ioctl(ddvd_fdvideo, VIDEO_SET_STREAMTYPE, 0) < 0 ||
+		ioctl(ddvd_fdvideo, VIDEO_PLAY, 0) < 0 ||
+		ioctl(ddvd_fdvideo, VIDEO_SLOWMOTION, 0) < 0 ||
+		ioctl(ddvd_fdvideo, VIDEO_FAST_FORWARD, 0) < 0 ||
+		ioctl(ddvd_fdvideo, VIDEO_CONTINUE, 0) < 0) {
+		Perror("Dream Amlogic decoder setup");
+		return -1;
+	}
+
+	ddvd_dream_aml_decoder_started = 1;
+	ddvd_dream_aml_resume_clock();
+	Debug(0, "Dream Amlogic MPEG-2 decoder started (%ux%u, rate=%u)\n",
+		sysinfo.width, sysinfo.height, sysinfo.rate);
+	return 0;
+}
+
+static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
+	size_t size,
+	uint64_t pts)
+{
+	struct ddvd_dream_video_frame frame;
+	struct pollfd descriptors[2];
+	struct video_event event;
+	size_t written = 0;
+	uint64_t backpressure_since = 0;
+	const uint8_t *sequence = ddvd_find_mpeg_sequence_header(data, size);
+
+	if (sequence != NULL)
+		ddvd_dream_aml_frame_pts_step =
+			ddvd_dream_aml_frame_pts_duration(sequence[7] & 0x0f);
+
+	if (!ddvd_dream_aml_decoder_started) {
+		/* A resume position can start between GOPs.  Wait for the next MPEG
+		 * sequence header so PAL/NTSC dimensions and frame duration are known
+		 * before opening the Amlogic decoder. */
+		if (ddvd_find_mpeg_sequence_header(data, size) == NULL)
+			return (ssize_t)size;
+		if (ddvd_dream_aml_start_decoder(data, size) < 0)
+			return -1;
+	}
+
+	ddvd_dream_aml_pace(pts);
+	memset(&frame, 0, sizeof(frame));
+	/* The normalized timestamp gives Amlogic a proper presentation anchor for
+	 * every grouped MPEG-2 block without exposing DVD cell/VOB clock jumps. */
+	frame.pts = pts;
+
+	while (written < size) {
+		int poll_result;
+		int count;
+
+		memset(descriptors, 0, sizeof(descriptors));
+		descriptors[0].fd = ddvd_fdvideo;
+		descriptors[0].events = POLLOUT | POLLPRI;
+		descriptors[1].fd = ddvd_dream_aml_poll_fd;
+		descriptors[1].events = POLLIN;
+		do {
+			poll_result = poll(descriptors, 2, 50);
+		} while (poll_result < 0 && errno == EINTR);
+
+		if (poll_result < 0 ||
+			(descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+			Perror("poll Dream Amlogic decoder");
+			return written ? (ssize_t)written : -1;
+		}
+		if ((descriptors[0].revents & POLLPRI) ||
+			(descriptors[1].revents & POLLIN)) {
+			memset(&event, 0, sizeof(event));
+			ioctl(ddvd_fdvideo, VIDEO_GET_EVENT, &event);
+		}
+		if (poll_result == 0 || !(descriptors[0].revents & POLLOUT)) {
+			if (!backpressure_since)
+				backpressure_since = ddvd_get_time();
+			if (ddvd_get_time() - backpressure_since >=
+				DDVD_DREAM_BACKPRESSURE_MS)
+				goto backpressure_timeout;
+			continue;
+		}
+
+		frame.bytes[0] = size - written;
+		frame.data[0] = data + written;
+		count = ioctl(ddvd_fdvideo, DDVD_DREAM_VIDEO_SET_FRAME, &frame);
+		if (count < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				if (!backpressure_since)
+					backpressure_since = ddvd_get_time();
+				if (ddvd_get_time() - backpressure_since >=
+					DDVD_DREAM_BACKPRESSURE_MS)
+					goto backpressure_timeout;
+				usleep(1000);
+				continue;
+			}
+			Perror("DREAM_VIDEO_SET_FRAME");
+			return written ? (ssize_t)written : -1;
+		}
+		if (count == 0) {
+			/* Zero is normal Dream decoder backpressure, not success and not
+			 * an invalid result.  Retry the unchanged fragment as Kodi does. */
+			if (!backpressure_since)
+				backpressure_since = ddvd_get_time();
+			if (ddvd_get_time() - backpressure_since >=
+				DDVD_DREAM_BACKPRESSURE_MS)
+				goto backpressure_timeout;
+			usleep(1000);
+			continue;
+		}
+		if ((size_t)count > size - written) {
+			Debug(0, "DREAM_VIDEO_SET_FRAME returned invalid byte count %d\n", count);
+			return written ? (ssize_t)written : -1;
+		}
+
+		written += count;
+		backpressure_since = 0;
+		ddvd_dream_aml_backpressure_logged = 0;
+		frame.pts = 0;
+	}
+
+	if (!ddvd_dream_aml_video_visible) {
+		ddvd_write_number(DDVD_DREAM_AML_DISABLE_VIDEO, 0);
+		ddvd_dream_aml_video_visible = 1;
+	}
+	return (ssize_t)written;
+
+backpressure_timeout:
+	if (!ddvd_dream_aml_backpressure_logged) {
+		Debug(0, "Dream video backpressure did not clear within %d ms\n",
+			DDVD_DREAM_BACKPRESSURE_MS);
+		ddvd_dream_aml_backpressure_logged = 1;
+	}
+	return written ? (ssize_t)written : -1;
+}
+
+/*
+ * dvdnav supplies MPEG-2 as small PES payload fragments, while Dream's private
+ * VIDEO_SET_FRAME ioctl is an access-unit interface.  Submitting everything
+ * between two sparse DVD PES timestamps creates 0.5--1.2 second bursts and a
+ * large PTS step can permanently stop amvdec_mpeg12.  Split at MPEG picture
+ * start codes and give every picture a continuous frame-rate-derived PTS.
+ */
+static ssize_t ddvd_dream_aml_write_es(const uint8_t *data, size_t size,
+	uint64_t pts)
+{
+	size_t input_size = size;
+	ssize_t result = 0;
+
+	(void)pts;
+
+	if (size == 0)
+		return 0;
+
+	if (size > DDVD_DREAM_MPEG2_PACKET_MAX_SIZE -
+		ddvd_dream_aml_packet_size) {
+		Debug(0, "Dream MPEG-2 timestamp packet exceeded %u bytes; dropping it\n",
+			(unsigned int)DDVD_DREAM_MPEG2_PACKET_MAX_SIZE);
+		ddvd_dream_aml_reset_packet();
+		return -1;
+	}
+
+	if (ddvd_dream_aml_reserve_packet(
+		ddvd_dream_aml_packet_size + size) < 0) {
+		ddvd_dream_aml_reset_packet();
+		return -1;
+	}
+	memcpy(ddvd_dream_aml_packet_data + ddvd_dream_aml_packet_size,
+		data, size);
+	ddvd_dream_aml_packet_size += size;
+
+	for (;;) {
+		size_t first_picture = ddvd_find_mpeg_picture_start(
+			ddvd_dream_aml_packet_data, ddvd_dream_aml_packet_size, 0);
+		size_t next_picture;
+
+		if (first_picture == SIZE_MAX)
+			break;
+		next_picture = ddvd_find_mpeg_picture_start(
+			ddvd_dream_aml_packet_data, ddvd_dream_aml_packet_size,
+			first_picture + 4);
+		if (next_picture == SIZE_MAX)
+			break;
+
+		result = ddvd_dream_aml_submit_packet(ddvd_dream_aml_packet_data,
+			next_picture, ddvd_dream_aml_output_pts);
+		if (result < 0)
+			return -1;
+		ddvd_dream_aml_output_pts += ddvd_dream_aml_frame_pts_step;
+		memmove(ddvd_dream_aml_packet_data,
+			ddvd_dream_aml_packet_data + next_picture,
+			ddvd_dream_aml_packet_size - next_picture);
+		ddvd_dream_aml_packet_size -= next_picture;
+	}
+	return (ssize_t)input_size;
+}
+
+static void ddvd_dream_aml_reset_decoder(void)
+{
+	if (!ddvd_dream_aml_active)
+		return;
+
+	/* dvdnav emits HOP_CHANNEL at ordinary DVD cell and menu boundaries.
+	 * On this driver VIDEO_CLEAR_BUFFER destroys and recreates amvdec_mpeg12;
+	 * doing that for every hop produces visible stop/start playback and also
+	 * races the interleaved audio stream.  Keep the monotonic output timeline,
+	 * drop only the unfinished userspace block and re-anchor wall-clock pacing. */
+	ddvd_dream_aml_reset_packet();
+	ddvd_dream_aml_reset_pacing();
+	/* A menu/cell hop also invalidates any partial AC-3 frame and queued PCM
+	 * from the previous cell.  Re-prepare ALSA without touching the decoder. */
+	ddvd_dream_alsa_reset();
+	ddvd_dream_aml_backpressure_logged = 0;
+}
+
+static void ddvd_dream_aml_stop(void)
+{
+	if (!ddvd_dream_aml_active)
+		return;
+
+	ddvd_dream_aml_reset_packet();
+	ddvd_write_number(DDVD_DREAM_AML_DISABLE_VIDEO, 1);
+	if (ddvd_dream_aml_decoder_started) {
+		ioctl(ddvd_fdvideo, VIDEO_CLEAR_BUFFER);
+		ioctl(ddvd_fdvideo, VIDEO_STOP, 0);
+	}
+	ioctl(ddvd_fdvideo, VIDEO_SLOWMOTION, 0);
+	ioctl(ddvd_fdvideo, VIDEO_FAST_FORWARD, 0);
+	ioctl(ddvd_fdvideo, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_DEMUX);
+	if (ddvd_dream_aml_poll_fd >= 0) {
+		close(ddvd_dream_aml_poll_fd);
+		ddvd_dream_aml_poll_fd = -1;
+	}
+	ddvd_dream_aml_decoder_started = 0;
+	ddvd_dream_aml_reset_pacing();
+}
+
+#else
+
+static int ddvd_dream_aml_active;
+
+static int ddvd_dream_aml_prepare(void)
+{
+	return 0;
+}
+
+static void ddvd_dream_aml_stop(void)
+{
+}
+
+static void ddvd_dream_aml_restore(void)
+{
+}
+
+static void ddvd_dream_aml_reset_pacing(void)
+{
+}
+
+static uint64_t ddvd_dream_aml_logical_pts(uint64_t dvd_pts,
+	uint64_t decoder_pts)
+{
+	(void)dvd_pts;
+	return decoder_pts;
+}
+
+static void ddvd_dream_aml_resume_clock(void)
+{
+}
+
+static void ddvd_dream_aml_reset_decoder(void)
+{
+}
+
+#endif /* __aarch64__ */
+
+#else
+
+static int ddvd_dream_aml_active;
+
+static void ddvd_dream_aml_stop(void)
+{
+}
+
+static void ddvd_dream_aml_restore(void)
+{
+}
+
+static void ddvd_dream_aml_reset_pacing(void)
+{
+}
+
+static uint64_t ddvd_dream_aml_logical_pts(uint64_t dvd_pts,
+	uint64_t decoder_pts)
+{
+	(void)dvd_pts;
+	return decoder_pts;
+}
+
+static void ddvd_dream_aml_resume_clock(void)
+{
+}
+
+static void ddvd_dream_aml_reset_decoder(void)
+{
+}
+
+#endif /* CONFIG_API_VERSION == 3 */
+
+static ssize_t ddvd_write_video_pes(const uint8_t *data, size_t size,
+	uint64_t pts)
+{
+#if CONFIG_API_VERSION == 3 && defined(__aarch64__)
+	if (ddvd_dream_aml_active) {
+		size_t header_size;
+		size_t packet_size;
+
+		if (size < 9 || data[0] != 0x00 || data[1] != 0x00 ||
+			data[2] != 0x01 || (data[3] & 0xf0) != 0xe0) {
+			Debug(0, "Invalid MPEG video PES packet\n");
+			return -1;
+		}
+		header_size = 9 + data[8];
+		packet_size = 6 + ((data[4] << 8) | data[5]);
+		if (packet_size == 6 || packet_size > size)
+			packet_size = size;
+		if (header_size >= packet_size)
+			return 0;
+		return ddvd_dream_aml_write_es(data + header_size,
+			packet_size - header_size, pts);
+	}
+#else
+	(void)pts;
 #endif
+
+	return safe_write(ddvd_output_fd, data, size);
+}
+
+static ssize_t ddvd_write_audio(const void *data, size_t size)
+{
+	return safe_write(ddvd_ac3_fd, data, size);
+}
+
+static int ddvd_has_dts_support(void)
+{
+	/* Enigma2 uses the same node to expose DTS controls to the user.  Checking
+	 * the driver interface keeps this independent of receiver model or CPU. */
+	return access("/proc/stb/audio/dts_choices", R_OK) == 0;
+}
+
+static int ddvd_is_hisilicon(void)
+{
+	static int detected = -1;
+
+	/* All supported HiSilicon images expose the vendor media stack here.  Use
+	 * the driver interface instead of a receiver model name. */
+	if (detected < 0)
+		detected = access("/proc/hisi/msp", F_OK) == 0;
+	return detected;
+}
+
+static int ddvd_hisilicon_configure_audio(int bypassmode)
+{
+	if (!ddvd_is_hisilicon())
+		return 0;
+
+	/* The HiSilicon driver selects a new hilib decoder only when audio
+	 * playback is restarted.  A bypass change on the running decoder leaves
+	 * the previous codec (normally AC-3) active. */
+	if (ioctl(ddvd_fdaudio, AUDIO_STOP) < 0)
+		Perror("AUDIO_STOP");
+	if (ioctl(ddvd_fdaudio, AUDIO_CLEAR_BUFFER) < 0)
+		Perror("AUDIO_CLEAR_BUFFER");
+	if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, bypassmode) < 0)
+		Perror("AUDIO_SET_BYPASS_MODE");
+	if (ioctl(ddvd_fdaudio, AUDIO_PLAY) < 0)
+		Perror("AUDIO_PLAY");
+	if (ioctl(ddvd_fdaudio, AUDIO_CONTINUE) < 0)
+		Perror("AUDIO_CONTINUE");
+	if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
+		Perror("AUDIO_SET_AV_SYNC");
+	return 1;
+}
+
+static uint16_t ddvd_audio_language(int audio_id)
+{
+	int logical_id = dvdnav_get_audio_logical_stream(dvdnav, audio_id);
+	uint16_t language = dvdnav_audio_stream_to_lang(dvdnav, logical_id);
+
+	return language == 0xFFFF ? 0x2D2D : language;
+}
+
+static int ddvd_audio_fallback(struct ddvd *playerconfig, int requested_id)
+{
+	uint16_t requested_language;
+	int i;
+
+	if (requested_id < 0 || requested_id >= MAX_AUDIO ||
+		playerconfig->audio_format[requested_id] != DDVD_DTS ||
+		ddvd_has_dts_support())
+		return requested_id;
+
+	requested_language = ddvd_audio_language(requested_id);
+
+	/* Prefer AC-3 as it preserves surround sound.  Language is preferred, but
+	 * an AC-3 track in another language still precedes a stereo fallback. */
+	for (i = 0; i < MAX_AUDIO; ++i) {
+		if (playerconfig->audio_format[i] == DDVD_AC3 &&
+			ddvd_audio_language(i) == requested_language)
+			return i;
+	}
+	for (i = 0; i < MAX_AUDIO; ++i) {
+		if (playerconfig->audio_format[i] == DDVD_AC3)
+			return i;
+	}
+
+	/* DVD stereo is normally MPEG audio or LPCM. */
+	for (i = 0; i < MAX_AUDIO; ++i) {
+		if ((playerconfig->audio_format[i] == DDVD_MPEG ||
+			playerconfig->audio_format[i] == DDVD_LPCM) &&
+			ddvd_audio_language(i) == requested_language)
+			return i;
+	}
+	for (i = 0; i < MAX_AUDIO; ++i) {
+		if (playerconfig->audio_format[i] == DDVD_MPEG ||
+			playerconfig->audio_format[i] == DDVD_LPCM)
+			return i;
+	}
+
+	return requested_id;
+}
 
 
 static int open_pipe(int fd[2])
@@ -181,7 +1007,6 @@ struct ddvd *ddvd_create(void)
 	pconfig->last_spu_id = -1;
 
 	// defaults
-	ddvd_set_ac3thru(pconfig, 0);
 	ddvd_set_language(pconfig, "en");
 	ddvd_set_dvd_path(pconfig, "/dev/cdroms/cdrom0");
 	ddvd_set_video(pconfig, DDVD_4_3, DDVD_LETTERBOX, DDVD_PAL);
@@ -282,10 +1107,11 @@ void ddvd_set_language(struct ddvd *pconfig, const char lang[2])
 	memcpy(pconfig->language, lang, 2);
 }
 
-// set internal ac3 decoding (needs liba52 which will be dynamically loaded)
+// retained for ABI compatibility; AC3 is handled by the platform decoder
 void ddvd_set_ac3thru(struct ddvd *pconfig, int ac3thru)
 {
-	pconfig->ac3thru = ac3thru;
+	(void)pconfig;
+	(void)ac3thru;
 }
 
 // set video options
@@ -613,7 +1439,8 @@ static int readMpegProc(char *str, int decoder)
 	sprintf(tmp, "/proc/stb/vmpeg/%d/%s", decoder, str);
 	FILE *f = fopen(tmp, "r");
 	if (f) {
-		fscanf(f, "%x", &val);
+		if (fscanf(f, "%x", &val) != 1)
+			val = -1;
 		fclose(f);
 	}
 	return val;
@@ -669,9 +1496,6 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 	unsigned char *p_lfb = playerconfig->lfb;
 	enum ddvd_result res = DDVD_OK;
 	int msg;
-	// try to load liba52.so.0 for softdecoding
-	int have_liba52 = ddvd_load_liba52();
-	state = NULL;
 	int audio_lock = 0;
 	int spu_lock = 0;
 
@@ -813,14 +1637,22 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 		goto err_open_ac3_fd;
 	}
 
-	if (ioctl(ddvd_fdvideo, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_MEMORY) < 0)
-		Perror("VIDEO_SELECT_SOURCE");
-	if (ioctl(ddvd_fdvideo, VIDEO_CLEAR_BUFFER) < 0)
-		Perror("VIDEO_CLEAR_BUFFER");
-	if (ioctl(ddvd_fdvideo, VIDEO_SET_STREAMTYPE, 0) < 0)	// set mpeg2
-		Perror("VIDEO_SET_STREAMTYPE");
-	if (ioctl(ddvd_fdvideo, VIDEO_PLAY) < 0)
-		Perror("VIDEO_PLAY");
+
+	int dream_aml = ddvd_dream_aml_prepare();
+	if (dream_aml < 0) {
+		res = DDVD_BUSY;
+		goto err_dvdnav_open;
+	}
+	if (!dream_aml) {
+		if (ioctl(ddvd_fdvideo, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_MEMORY) < 0)
+			Perror("VIDEO_SELECT_SOURCE");
+		if (ioctl(ddvd_fdvideo, VIDEO_CLEAR_BUFFER) < 0)
+			Perror("VIDEO_CLEAR_BUFFER");
+		if (ioctl(ddvd_fdvideo, VIDEO_SET_STREAMTYPE, 0) < 0)	// set mpeg2
+			Perror("VIDEO_SET_STREAMTYPE");
+		if (ioctl(ddvd_fdvideo, VIDEO_PLAY) < 0)
+			Perror("VIDEO_PLAY");
+	}
 
 	if (ioctl(ddvd_fdaudio, AUDIO_SELECT_SOURCE, AUDIO_SOURCE_MEMORY) < 0)
 		Perror("AUDIO_SELECT_SOURCE");
@@ -832,6 +1664,8 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 # error please define CONFIG_API_VERSION to be 1 or 3
 #endif
 
+	Debug(0, "Using platform AC-3 decoder\n");
+
 	int i;
 // show startup screen
 #if SHOW_START_SCREEN == 1
@@ -840,9 +1674,11 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 	for (i = 0; i < 10; i++)
 		safe_write(ddvd_output_fd, ddvd_startup_logo, sizeof(ddvd_startup_logo));
 # else
-	unsigned char pes_header[] = { 0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00 };
-	safe_write(ddvd_output_fd, pes_header, sizeof(pes_header));
-	safe_write(ddvd_output_fd, ddvd_startup_logo, sizeof(ddvd_startup_logo));
+	if (!ddvd_dream_aml_active) {
+		unsigned char pes_header[] = { 0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00 };
+		safe_write(ddvd_output_fd, pes_header, sizeof(pes_header));
+		safe_write(ddvd_output_fd, ddvd_startup_logo, sizeof(ddvd_startup_logo));
+	}
 # endif
 #endif
 
@@ -858,25 +1694,10 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 
 	unsigned char lpcm_data[2048 * 6 * 6 /*4608 */ ];
 	int mpa_header_length;
-	int mpa_count, mpa_count2;
+	int mpa_count;
 	uint8_t mpa_data[2048 * 4];
-	int ac3_len;
-	int16_t ac3_tmp[2048 * 6 * 6];
 
 	ddvd_mpa_init(48000, 192000);	//init MPA Encoder with 48kHz and 192k Bitrate
-
-	int ac3thru = 1;
-	if (have_liba52) {
-		state = ddvd_a52_init(0);	//init AC3 Decoder
-		if (state != NULL) {
-			ac3thru = playerconfig->ac3thru;
-		}
-		else {
-			Debug(0, "Could not initialize liba52; using AC3 pass-through\n");
-			ddvd_close_liba52();
-			have_liba52 = 0;
-		}
-	}
 
 	char osdtext[512];
 	osdtext[0] = 0;
@@ -906,7 +1727,8 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 	int rccode;
 	int ismute = 0;
 
-	if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
+	if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
+		ddvd_dream_aml_active ? 0 : 1) < 0)
 		Perror("AUDIO_SET_AV_SYNC");
 #if CONFIG_API_VERSION == 1
 	// set video system
@@ -1046,7 +1868,8 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 				#define BACKWARD_WAIT 500
 				int64_t offset = (ddvd_trickspeed - 1) * 90000L * (ddvd_trickmode & TRICKBW ? BACKWARD_WAIT : FORWARD_WAIT) / 1000;
 				int64_t newpos = (int64_t)pos +(offset + (int64_t)(vpts > pts ? pts - vpts : 0)) * (int64_t)len / ddvd_lastCellEventInfo.pgc_length;
-				Debug(1, "FAST FW/BW: %d -> %lld - %lld - SPU clr=%d->%d vpts=%llu pts=%llu\n", pos, newpos, offset, ddvd_spu_play, ddvd_spu_ind, vpts, pts);
+				Debug(1, "FAST FW/BW: %u -> %lld - %lld - SPU clr=%d->%d vpts=%llu pts=%llu\n",
+					pos, (long long)newpos, (long long)offset, ddvd_spu_play, ddvd_spu_ind, vpts, pts);
 				if (newpos <= 0) {	// reached begin of movie
 					newpos = 0;
 					reached_sof = 1;
@@ -1153,8 +1976,8 @@ send_message:
 					for (i = 0; i < 10; i++)
 						safe_write(ddvd_output_fd, last_iframe, ddvd_last_iframe_len);
 #else
-					safe_write(ddvd_output_fd, last_iframe, ddvd_last_iframe_len);
-					safe_write(ddvd_output_fd, last_iframe, ddvd_last_iframe_len); // send twice to avoid no-display...
+					ddvd_write_video_pes(last_iframe, ddvd_last_iframe_len, vpts);
+					ddvd_write_video_pes(last_iframe, ddvd_last_iframe_len, vpts); // send twice to avoid no-display...
 #endif
 					//Debug(1, "Show iframe with size: %d\n",ddvd_last_iframe_len);
 					ddvd_last_iframe_len = 0;
@@ -1190,6 +2013,22 @@ send_message:
 						playerconfig->audio_format[stream_type - 0x88] = DDVD_DTS;
 					if ((buf[14 + 3]) == 0xBD && (stream_type & 0xF8) == 0xA0)
 						playerconfig->audio_format[stream_type - 0xA0] = DDVD_LPCM;
+
+					if (audio_id >= 0 && audio_id < MAX_AUDIO &&
+						playerconfig->audio_format[audio_id] == DDVD_DTS &&
+						!ddvd_has_dts_support()) {
+						int fallback_id = ddvd_audio_fallback(playerconfig, audio_id);
+
+						if (fallback_id != audio_id) {
+							Debug(1, "DTS audio %d unsupported, using audio %d\n",
+								audio_id, fallback_id);
+							audio_id = fallback_id;
+							audio_type = DDVD_UNKNOWN;
+							audio_lock = 1;
+							report_audio_info = 1;
+							ddvd_play_empty(TRUE);
+						}
+					}
 
 					if ((buf[14 + 3] & 0xF0) == 0xE0) {	// video
 						int pes_len = ((buf[14 + 4] << 8) | buf[14 + 5]) + 6;
@@ -1245,14 +2084,15 @@ send_message:
 								ddvd_have_ntsc = 0;
 						}
 
-						if (padding > 8) {
+						if (!ddvd_dream_aml_active && padding > 8) {
 							memcpy(buf + 14 + pes_len, "\x00\x00\x01\xE0\x00\x00\x80\x00\x00", 9);
 							pes_len += 9;
 						}
 
-						safe_write(ddvd_output_fd, buf + 14, pes_len);
+						ddvd_write_video_pes(buf + 14, pes_len,
+							(buf[14 + 7] & 128) ? vpts : UINT64_MAX);
 
-						if (padding && padding < 9)
+						if (!ddvd_dream_aml_active && padding && padding < 9)
 							safe_write(ddvd_output_fd, "\x00\x00\x01\xE0\x00\x00\x80\x00\x00", 9);
 
 						// 14+8 header_length
@@ -1319,7 +2159,8 @@ send_message:
 					else if ((buf[14 + 3]) == 0xC0 + audio_id) {	// mpeg audio
 						if (audio_type != DDVD_MPEG) {
 							//Debug(1, "Switch to MPEG Audio\n");
-							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
+							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
+								ddvd_dream_aml_active ? 0 : 1) < 0)
 								Perror("AUDIO_SET_AV_SYNC");
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, 1) < 0)
 								Perror("AUDIO_SET_BYPASS_MODE");
@@ -1336,7 +2177,7 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-						safe_write(ddvd_ac3_fd, buf + 14, buf[19] + (buf[18] << 8) + 6);
+						ddvd_write_audio(buf + 14, buf[19] + (buf[18] << 8) + 6);
 					}
 					else if ((buf[14 + 3]) == 0xBD && (buf[14 + buf[14 + 8] + 9]) == 0xA0 + audio_id) {	// lpcm audio
 						// autodetect bypass mode
@@ -1349,7 +2190,8 @@ send_message:
 
 						if (audio_type != DDVD_LPCM) {
 							//Debug(1, "Switch to LPCM Audio\n");
-							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
+							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
+								ddvd_dream_aml_active ? 0 : 1) < 0)
 								Perror("AUDIO_SET_AV_SYNC");
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, lpcm_mode) < 0)
 								Perror("AUDIO_SET_BYPASS_MODE");
@@ -1400,7 +2242,7 @@ send_message:
 								//patch header type to mpeg
 								mpa_data[3] = 0xC0;
 								//write
-								safe_write(ddvd_ac3_fd, mpa_data, mpa_count + mpa_header_length);
+								ddvd_write_audio(mpa_data, mpa_count + mpa_header_length);
 								memcpy(lpcm_data, abuf + (4608 - ddvd_lpcm_count), i - (4608 - ddvd_lpcm_count));
 								ddvd_lpcm_count = i - (4608 - ddvd_lpcm_count);
 								memcpy(mpa_data, buf + 14, buf[14 + 8] + 9);
@@ -1412,19 +2254,26 @@ send_message:
 							}
 						}
 						else
-							safe_write(ddvd_ac3_fd, buf + 14 , buf[19] + (buf[18] << 8) + 6);
+							ddvd_write_audio(buf + 14 , buf[19] + (buf[18] << 8) + 6);
 					}
 					else if ((buf[14 + 3]) == 0xBD && (buf[14 + buf[14 + 8] + 9]) == 0x88 + audio_id) {	// dts audio
 						if (audio_type != DDVD_DTS) {
-							//Debug(1, "Switch to DTS Audio (thru)\n");
-							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
-								Perror("AUDIO_SET_AV_SYNC");
+							int dts_bypassmode;
 #ifdef CONVERT_TO_DVB_COMPLIANT_DTS
-							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, 2) < 0)	// DTS (dvb compliant)
+							dts_bypassmode = 2;
 #else
-							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, 5) < 0)	// DTS VOB
+							dts_bypassmode = 5;
 #endif
-								Perror("AUDIO_SET_BYPASS_MODE");
+							Debug(1, "Switch to DTS Audio id=%d stream=0x%02X bypass=%d\n",
+								audio_id, 0x88 + audio_id, dts_bypassmode);
+							if (!ddvd_dream_aml_active) {
+								if (!ddvd_hisilicon_configure_audio(dts_bypassmode)) {
+									if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
+										Perror("AUDIO_SET_AV_SYNC");
+									if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, dts_bypassmode) < 0)
+										Perror("AUDIO_SET_BYPASS_MODE");
+								}
+							}
 							audio_type = DDVD_DTS;
 						}
 
@@ -1438,34 +2287,46 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-#ifdef CONVERT_TO_DVB_COMPLIANT_DTS
-						unsigned short pes_len = (buf[14 + 4] << 8 | buf[14 + 5]);
-						pes_len -= 4;	// strip first 4 bytes of pes payload
-						buf[14 + 4] = pes_len >> 8;	// patch pes len
-						buf[15 + 4] = pes_len & 0xFF;
+						if (ddvd_dream_aml_active) {
+							int raw_dts_size = ((buf[18] << 8) | buf[19]) -
+								buf[22] - 7;
 
-						safe_write(ddvd_ac3_fd, buf + 14, 9 + buf[14 + 8]);	// write pes_header
-						safe_write(ddvd_ac3_fd, buf + 14 + 9 + buf[14 + 8] + 4, pes_len - (3 + buf[14 + 8]));	// write pes_payload
+							if (raw_dts_size > 0)
+								ddvd_dream_audio_decode_dts(
+									buf + buf[22] + 27,
+									(size_t)raw_dts_size, apts);
+						}
+						else {
+#ifdef CONVERT_TO_DVB_COMPLIANT_DTS
+							unsigned short pes_len = (buf[14 + 4] << 8 | buf[14 + 5]);
+							pes_len -= 4;	// strip first 4 bytes of pes payload
+							buf[14 + 4] = pes_len >> 8;	// patch pes len
+							buf[15 + 4] = pes_len & 0xFF;
+
+							ddvd_write_audio(buf + 14, 9 + buf[14 + 8]);	// write pes_header
+							ddvd_write_audio(buf + 14 + 9 + buf[14 + 8] + 4, pes_len - (3 + buf[14 + 8]));	// write pes_payload
 #else
-						safe_write(ddvd_ac3_fd, buf + 14, buf[19] + (buf[18] << 8) + 6);
+							ddvd_write_audio(buf + 14, buf[19] + (buf[18] << 8) + 6);
 #endif
+						}
 					}
 					else if ((buf[14 + 3]) == 0xBD && (buf[14 + buf[14 + 8] + 9]) == 0x80 + audio_id) {	// ac3 audio
 						if (audio_type != DDVD_AC3) {
 							//Debug(1, "Switch to AC3 Audio\n");
-							int bypassmode;
-							if (ac3thru || !have_liba52) // !have_liba52 and !ac3thru should never happen, but who knows ;)
+							if (!ddvd_dream_aml_active) {
+								int bypassmode;
 #ifdef CONVERT_TO_DVB_COMPLIANT_AC3
 								bypassmode = 0;
 #else
 								bypassmode = 3;
 #endif
-							else
-								bypassmode = 1;
-							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
-								Perror("AUDIO_SET_AV_SYNC");
-							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, bypassmode) < 0)
-									Perror("AUDIO_SET_BYPASS_MODE");
+								if (!ddvd_hisilicon_configure_audio(bypassmode)) {
+									if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
+										Perror("AUDIO_SET_AV_SYNC");
+									if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, bypassmode) < 0)
+										Perror("AUDIO_SET_BYPASS_MODE");
+								}
+							}
 							audio_type = DDVD_AC3;
 						}
 
@@ -1479,63 +2340,28 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-						if (ac3thru || !have_liba52) {	// !have_liba52 and !ac3thru should never happen, but who knows ;)
+						if (ddvd_dream_aml_active) {
+							int raw_ac3_size = ((buf[18] << 8) | buf[19]) -
+								buf[22] - 7;
+
+							if (raw_ac3_size > 0)
+								ddvd_dream_audio_decode_ac3(
+									buf + buf[22] + 27,
+									(size_t)raw_ac3_size, apts);
+						}
+						else {
 #ifdef CONVERT_TO_DVB_COMPLIANT_AC3
 							unsigned short pes_len = (buf[14 + 4] << 8 | buf[14 + 5]);
 							pes_len -= 4;	// strip first 4 bytes of pes payload
 							buf[14 + 4] = pes_len >> 8;	// patch pes len
 							buf[15 + 4] = pes_len & 0xFF;
 
-							safe_write(ddvd_ac3_fd, buf + 14, 9 + buf[14 + 8]);	// write pes_header
-							safe_write(ddvd_ac3_fd, buf + 14 + 9 + buf[14 + 8] + 4, pes_len - (3 + buf[14 + 8]));	// write pes_payload
+							ddvd_write_audio(buf + 14, 9 + buf[14 + 8]);	// write pes_header
+							ddvd_write_audio(buf + 14 + 9 + buf[14 + 8] + 4, pes_len - (3 + buf[14 + 8]));	// write pes_payload
 #else
-							safe_write(ddvd_ac3_fd, buf + 14, buf[19] + (buf[18] << 8) + 6);
+							ddvd_write_audio(buf + 14, buf[19] + (buf[18] << 8) + 6);
 #endif
 							//fwrite(buf + buf[22] + 27, 1, ((buf[18] << 8) | buf[19]) - buf[22] - 7, fac3); //debugwrite
-						}
-						else {
-							// a bit more funny than lpcm sound, because we do a complete recoding here
-							// we will decode the ac3 data to plain lpcm and will then encode to mpeg
-							// audio and send them with pts information to the decoder to get a sync.
-
-							// decode and convert ac3 to raw lpcm
-							ac3_len = ddvd_ac3_decode(buf + buf[22] + 27, ((buf[18] << 8) | buf[19]) - buf[22] - 7, ac3_tmp);
-
-							// save the pes header incl. PTS
-							memcpy(mpa_data, buf + 14, buf[14 + 8] + 9);
-							mpa_header_length = buf[14 + 8] + 9;
-
-							//apts -= (((unsigned long long)(ddvd_lpcm_count) * 90) / 192);
-
-							//mpa_data[14] = (int)((apts << 1) & 0xFF);
-							//mpa_data[12] = (int)((apts >> 7) & 0xFF);
-							//mpa_data[11] = (int)(((apts << 1) >> 15) & 0xFF);
-							//mpa_data[10] = (int)((apts >> 22) & 0xFF);
-
-							// copy lpcm data into buffer for encoding
-							memcpy(lpcm_data + ddvd_lpcm_count, ac3_tmp, ac3_len);
-							ddvd_lpcm_count += ac3_len;
-
-							// encode the whole packet to mpa
-							mpa_count2 = mpa_count = 0;
-							while (ddvd_lpcm_count >= 4608) {
-								mpa_count = ddvd_mpa_encode_frame(mpa_data + mpa_header_length + mpa_count2, 4608, lpcm_data);
-								mpa_count2 += mpa_count;
-								ddvd_lpcm_count -= 4608;
-								memcpy(lpcm_data, lpcm_data + 4608, ddvd_lpcm_count);
-							}
-
-							// patch pes__packet_length
-							mpa_count = mpa_count2 + mpa_header_length - 6;
-							mpa_data[4] = mpa_count >> 8;
-							mpa_data[5] = mpa_count & 0xFF;
-
-							// patch header type to mpeg
-							mpa_data[3] = 0xC0;
-
-							// write to decoder
-							safe_write(ddvd_ac3_fd, mpa_data, mpa_count2 + mpa_header_length);
-
 						}
 					}
 					else if ((buf[14 + 3]) == 0xBD && ((buf[14 + buf[14 + 8] + 9]) & 0xE0) == 0x20 && ((buf[14 + buf[14 + 8] + 9]) & 0x1F) == spu_active_id) {	// SPU packet
@@ -1706,6 +2532,8 @@ send_message:
 
 			case DVDNAV_AUDIO_STREAM_CHANGE:
 				/* We received a new Audio stream ID  */
+				Debug(1, "DVDNAV_AUDIO_STREAM_CHANGE active=%d current=%d lock=%d\n",
+					dvdnav_get_active_audio_stream(dvdnav), audio_id, audio_lock);
 				if (!audio_lock) {
 					audio_id = dvdnav_get_active_audio_stream(dvdnav);
 					report_audio_info = 1;
@@ -1795,7 +2623,7 @@ send_message:
 					// resuming a dvd ?
 					if (playerconfig->should_resume && next_cell_change) {
 						if (dvdnav_sector_search(dvdnav, playerconfig->resume_block, SEEK_SET) == DVDNAV_STATUS_OK) {
-							Debug(3, "    resuming to block %d\n", playerconfig->resume_block);
+							Debug(3, "    resuming to block %lu\n", playerconfig->resume_block);
 							audio_id = playerconfig->resume_audio_id;
 							audio_lock = 1;//playerconfig->resume_audio_lock;
 							spu_active_id = playerconfig->resume_spu_id;
@@ -1826,7 +2654,7 @@ send_message:
 							msg = DDVD_SHOWOSD_TIME; // send new position to the frontend
 						}
 						else
-							Debug(2, "    resume failed: cannot find/seek to block %d\n", playerconfig->resume_block);
+							Debug(2, "    resume failed: cannot find/seek to block %lu\n", playerconfig->resume_block);
 
 						// avoid subsequent resumes
 						next_cell_change = 0;
@@ -1978,8 +2806,21 @@ send_message:
 				}
 			}
 		}
-		if (ioctl(ddvd_fdvideo, VIDEO_GET_PTS, &pts) < 0)
+		if (ddvd_is_hisilicon()) {
+			/* HiSilicon logs every VIDEO_GET_PTS call in the kernel and can keep
+			 * returning a stale value while dvdnav transitions into a submenu.
+			 * This floods printk and starves menu navigation.  The current video
+			 * PES PTS is a usable clock for this decoder and avoids the broken
+			 * ioctl on both sides of the menu-domain transition. */
+			pts = vpts;
+			if (ddvd_spu_play < ddvd_spu_ind && pts < spupts &&
+				(ddvd_still_frame || ddvd_wait_highlight ||
+				 dvdnav_is_domain_vmgm(dvdnav) || dvdnav_is_domain_vtsm(dvdnav)))
+				pts = spupts;
+		}
+		else if (ioctl(ddvd_fdvideo, VIDEO_GET_PTS, &pts) < 0)
 			Perror("VIDEO_GET_PTS");
+		pts = ddvd_dream_aml_logical_pts(vpts, pts);
 		// pts+10 to avoid decoder time rounding errors. Seen vpts=11555 and pts=11554 ...
 		signed long long spudiff = pts+10 - spupts;
 #endif
@@ -2522,6 +3363,7 @@ key_play:
 								Debug(3, "DDVD_KEY_PLAY cont audio and video\n");
 								if (ioctl(ddvd_fdaudio, AUDIO_CONTINUE) < 0)
 									Perror("AUDIO_CONTINUE");
+								ddvd_dream_aml_resume_clock();
 								if (ioctl(ddvd_fdvideo, VIDEO_CONTINUE) < 0)
 									Perror("VIDEO_CONTINUE");
 								msg = DDVD_SHOWOSD_STATE_PLAY;
@@ -2596,7 +3438,10 @@ key_play:
 								Perror("AUDIO_SET_MUTE");
 						}
 						// determine if flip to/from driver (smooth) or trick fast forward
-						if (ddvd_trickspeed > 0 && ddvd_trickspeed < 7) { // higher speeds cannot be handled reliably by driver
+						/* The private Dream frame ABI has no reliable driver trickmode;
+						 * use dvdnav sector jumps there for every fast speed. */
+						if (!ddvd_dream_aml_active &&
+							ddvd_trickspeed > 0 && ddvd_trickspeed < 7) {
 							ddvd_trickmode = FASTFW;
 							if (ioctl(ddvd_fdvideo, VIDEO_FAST_FORWARD, ddvd_trickspeed) < 0)
 								Perror("VIDEO_FAST_FORWARD");
@@ -2622,7 +3467,8 @@ key_play:
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_MUTE, 1) < 0)
 								Perror("AUDIO_SET_MUTE");
 							ddvd_trickspeed = 2;
-							ddvd_trickmode = (rccode == DDVD_KEY_FBWD ? TRICKBW : FASTFW);
+							ddvd_trickmode = rccode == DDVD_KEY_FBWD ? TRICKBW :
+								(ddvd_dream_aml_active ? TRICKFW : FASTFW);
 						}
 						else if (ddvd_trickmode & (rccode == DDVD_KEY_FBWD ? (TRICKFW|FASTFW) : TRICKBW)) {
 							ddvd_trickspeed /= 2;
@@ -2636,7 +3482,7 @@ key_play:
 
 						Debug(3, "FAST%cWD speed %dx\n", ddvd_trickmode & (TRICKFW|FASTFW) ? 'F' : 'B', ddvd_trickspeed);
 						if (ddvd_trickmode & (TRICKFW|FASTFW)) {
-							if (ddvd_trickspeed < 7) { // higher speeds cannot be handled reliably by driver
+							if (!ddvd_dream_aml_active && ddvd_trickspeed < 7) {
 								ddvd_trickmode = FASTFW; // Driver fast forward
 								if (ioctl(ddvd_fdvideo, VIDEO_FAST_FORWARD, ddvd_trickspeed) < 0)
 									Perror("VIDEO_FAST_FORWARD");
@@ -2668,7 +3514,9 @@ key_play:
 							if (!len)
 								len = 1;
 							int64_t newpos = pos + (skip * 90000L + (int64_t)(vpts > pts ? pts - vpts : 0)) * (int64_t)len / ddvd_lastCellEventInfo.pgc_length;
-							Debug(3, "DDVD_SKIP skip=%d oldpos=%u len=%u pgc=%lld newpos=%lld vpts=%llu pts=%llu\n", skip, pos, len, ddvd_lastCellEventInfo.pgc_length, newpos, vpts, pts);
+							Debug(3, "DDVD_SKIP skip=%d oldpos=%u len=%u pgc=%lld newpos=%lld vpts=%llu pts=%llu\n",
+								skip, pos, len, (long long)ddvd_lastCellEventInfo.pgc_length,
+								(long long)newpos, vpts, pts);
 							if (newpos >= len) {	// reached end of movie
 								newpos = len - 250;
 								reached_eof = 1;
@@ -2692,15 +3540,17 @@ key_play:
 						Debug(1, "DDVD_SET_AUDIO CURRENT %i\n", audio_id);
 						if (rccode == DDVD_SET_AUDIO) {
 							ddvd_readpipe(key_pipe, &count, sizeof(int), 1);
-							if (count < MAX_AUDIO && playerconfig->audio_format[count] != -1)
-								audio_id = count;
+							if (count >= 0 && count < MAX_AUDIO && playerconfig->audio_format[count] != -1)
+								audio_id = ddvd_audio_fallback(playerconfig, count);
 						}
 						else {
 							do {
 								audio_id++;
 								if (audio_id >= MAX_AUDIO)
 									audio_id = 0;
-							} while (playerconfig->audio_format[audio_id] == -1 && count++ < MAX_AUDIO);
+							} while ((playerconfig->audio_format[audio_id] == -1 ||
+								(!ddvd_has_dts_support() && playerconfig->audio_format[audio_id] == DDVD_DTS)) &&
+								count++ < MAX_AUDIO);
 						}
 						Debug(1, "DDVD_SET_AUDIO %i\n", audio_id);
 						report_audio_info = 1;
@@ -2773,9 +3623,13 @@ err_dvdnav:
 		Debug(1, "Error on dvdnav_close: %s\n", dvdnav_err_to_string(dvdnav));
 
 err_dvdnav_open:
-	ddvd_device_clear();
-	if (ioctl(ddvd_fdvideo, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_DEMUX) < 0)
-		Perror("VIDEO_SELECT_SOURCE");
+	if (ddvd_dream_aml_active)
+		ddvd_dream_aml_stop();
+	else {
+		ddvd_device_clear();
+		if (ioctl(ddvd_fdvideo, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_DEMUX) < 0)
+			Perror("VIDEO_SELECT_SOURCE");
+	}
 	if (ioctl(ddvd_fdaudio, AUDIO_SELECT_SOURCE, AUDIO_SOURCE_DEMUX) < 0)
 		Perror("AUDIO_SELECT_SOURCE");
 	if (ddvd_ac3_fd >= 0)
@@ -2790,6 +3644,7 @@ err_open_fdvideo:
 	if (ddvd_output_fd >= 0 && ddvd_output_fd != ddvd_fdvideo)
 		close(ddvd_output_fd);
 	ddvd_ac3_fd = ddvd_fdaudio = ddvd_fdvideo = ddvd_output_fd = -1;
+	ddvd_dream_aml_restore();
 err_open_output_fd:
 
 	//Clear Screen
@@ -2819,13 +3674,6 @@ err_malloc:
 		free(ddvd_lbb2);
 	if (last_iframe != NULL)
 		free(last_iframe);
-
-	if (have_liba52) {
-		if (state != NULL)
-			ddvd_a52_free(state);
-		state = NULL;
-		ddvd_close_liba52();
-	}
 
 #if CONFIG_API_VERSION == 3
 	ddvd_unset_pcr_offset();
@@ -2958,7 +3806,13 @@ static void ddvd_play_empty(int device_clear)
 // Empty Device Buffers
 static void ddvd_device_clear(void)
 {
+	int clear_video = 1;
+
 	Debug(3, "device_clear: clear audio and video buffers\n");
+	if (ddvd_dream_aml_active) {
+		ddvd_dream_aml_reset_decoder();
+		return;
+	}
 
 	if (ioctl(ddvd_fdaudio, AUDIO_CLEAR_BUFFER) < 0)
 		Perror("AUDIO_CLEAR_BUFFER");
@@ -2967,14 +3821,37 @@ static void ddvd_device_clear(void)
 	if (ioctl(ddvd_fdaudio, AUDIO_CONTINUE) < 0)
 		Perror("AUDIO_CONTINUE");
 
-	if (ioctl(ddvd_fdvideo, VIDEO_CLEAR_BUFFER) < 0)
-		Perror("VIDEO_CLEAR_BUFFER");
-	if (ioctl(ddvd_fdvideo, VIDEO_PLAY) < 0)
-		Perror("VIDEO_PLAY");
-	if (ioctl(ddvd_fdvideo, VIDEO_CONTINUE) < 0)
-		Perror("VIDEO_CONTINUE");
+	if (ddvd_is_hisilicon()) {
+		/* Activating a DVD menu button is immediately followed by a
+		 * DVDNAV_HOP_CHANNEL event.  Both paths clear the devices.  A second
+		 * HiSilicon video flush while its decoder is restarting can discard
+		 * the short I-frame which contains the next still menu. */
+		static uint64_t last_video_clear;
+		static int last_video_clear_valid;
+		uint64_t now = ddvd_get_time();
 
-	if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
+		if (last_video_clear_valid && now - last_video_clear < 250) {
+			clear_video = 0;
+			Debug(2, "Skip duplicate HiSilicon video buffer clear (%llu ms)\n",
+				(unsigned long long)(now - last_video_clear));
+		}
+		else {
+			last_video_clear = now;
+			last_video_clear_valid = 1;
+		}
+	}
+
+	if (!ddvd_dream_aml_active) {
+		if (clear_video && ioctl(ddvd_fdvideo, VIDEO_CLEAR_BUFFER) < 0)
+			Perror("VIDEO_CLEAR_BUFFER");
+		if (ioctl(ddvd_fdvideo, VIDEO_PLAY) < 0)
+			Perror("VIDEO_PLAY");
+		if (ioctl(ddvd_fdvideo, VIDEO_CONTINUE) < 0)
+			Perror("VIDEO_CONTINUE");
+	}
+
+	if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
+		ddvd_dream_aml_active ? 0 : 1) < 0)
 		Perror("AUDIO_SET_AV_SYNC");
 }
 
