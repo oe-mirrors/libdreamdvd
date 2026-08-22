@@ -27,42 +27,26 @@
 
 #define __A52DEC_H__
 
+#include <stdint.h>
+#include <a52dec/a52.h>
 
-typedef int32_t sample_t;
-typedef int32_t level_t;
-
-typedef struct a52_state_s a52_state_t;
-
-#define A52_CHANNEL 0
-#define A52_MONO 1
-#define A52_STEREO 2
-#define A52_3F 3
-#define A52_2F1R 4
-#define A52_3F1R 5
-#define A52_2F2R 6
-#define A52_3F2R 7
-#define A52_CHANNEL1 8
-#define A52_CHANNEL2 9
-#define A52_DOLBY 10
-#define A52_CHANNEL_MASK 15
-
-#define A52_LFE 16
-#define A52_ADJUST_LEVEL 32
-
-// liba52 function defs for using dlsym
-extern a52_state_t * (*a52_init) (uint32_t);
-extern sample_t * (*a52_samples) (a52_state_t *);
-extern int (*a52_syncinfo) (uint8_t * , int * , int * , int * );
-extern int (*a52_frame) (a52_state_t * , uint8_t * , int * , level_t * , sample_t );
-extern int (*a52_block) (a52_state_t * );
-extern void (*a52_free) (a52_state_t * );
+/* Keep the dynamically loaded function signatures tied to the installed
+ * liba52 headers.  In particular, sample_t is float in the normal liba52
+ * build.  Declaring it as an integer changes the calling convention on
+ * AArch64 and corrupts the decoded samples on every architecture. */
+extern __typeof__(a52_init) *ddvd_a52_init;
+extern __typeof__(a52_samples) *ddvd_a52_samples;
+extern __typeof__(a52_syncinfo) *ddvd_a52_syncinfo;
+extern __typeof__(a52_frame) *ddvd_a52_frame;
+extern __typeof__(a52_block) *ddvd_a52_block;
+extern __typeof__(a52_free) *ddvd_a52_free;
 
 extern void *a52_handle;
 
 extern a52_state_t * state;
 
 int ddvd_ac3_decode(const uint8_t *input, unsigned int len, int16_t *output);
-int ddvd_load_liba52();
-void ddvd_close_liba52();
+int ddvd_load_liba52(void);
+void ddvd_close_liba52(void);
 
 #endif

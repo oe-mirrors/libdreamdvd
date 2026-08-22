@@ -36,12 +36,12 @@
 
 #include "a52dec.h"
 
-a52_state_t * (*a52_init) (uint32_t);
-sample_t * (*a52_samples) (a52_state_t *);
-int (*a52_syncinfo) (uint8_t * , int * , int * , int * );
-int (*a52_frame) (a52_state_t * , uint8_t * , int * , level_t * , sample_t );
-int (*a52_block) (a52_state_t * );
-void (*a52_free) (a52_state_t * );
+__typeof__(a52_init) *ddvd_a52_init;
+__typeof__(a52_samples) *ddvd_a52_samples;
+__typeof__(a52_syncinfo) *ddvd_a52_syncinfo;
+__typeof__(a52_frame) *ddvd_a52_frame;
+__typeof__(a52_block) *ddvd_a52_block;
+__typeof__(a52_free) *ddvd_a52_free;
 
 void *a52_handle;
 
@@ -50,42 +50,67 @@ a52_state_t * state;
 
 // try to dynamically load and wrap liba52.so.0
 
-int ddvd_load_liba52()
+int ddvd_load_liba52(void)
 {
-	a52_handle = dlopen("liba52.so.0",RTLD_LAZY);
-	
-	if (a52_handle)
-	{
-		a52_init = (a52_state_t* (*)(uint32_t)) dlsym(a52_handle, "a52_init");
-		a52_samples = (sample_t* (*)(a52_state_t*)) dlsym(a52_handle, "a52_samples");
-		a52_syncinfo = (int (*)(uint8_t*, int*, int*, int*)) dlsym(a52_handle, "a52_syncinfo");
-		a52_frame = (int (*)(a52_state_t* ,uint8_t* ,int* ,level_t* ,sample_t)) dlsym(a52_handle, "a52_frame");
-		a52_block = (int (*)(a52_state_t*)) dlsym(a52_handle, "a52_block");
-		a52_free = (void (*)(a52_state_t*)) dlsym(a52_handle, "a52_free");
-
-		printf("libdreamdvd: soft ac3 decoding is available, liba52.so.0 loaded !\n");
-		return 1;
-	}
-	else
-	{
-		printf("libdreamdvd: soft ac3 decoding is not available, liba52.so.0 not found !\n");
+	a52_handle = dlopen("liba52.so.0", RTLD_NOW | RTLD_LOCAL);
+	if (!a52_handle) {
+		printf("libdreamdvd: soft ac3 decoding is not available: %s\n", dlerror());
 		return 0;
 	}
+
+#define LOAD_A52_SYMBOL(name) do { \
+	dlerror(); \
+	ddvd_##name = (__typeof__(ddvd_##name))dlsym(a52_handle, #name); \
+	const char *error = dlerror(); \
+	if (error != NULL) { \
+		printf("libdreamdvd: cannot load liba52 symbol %s: %s\n", #name, error); \
+		goto error; \
+	} \
+} while (0)
+
+	LOAD_A52_SYMBOL(a52_init);
+	LOAD_A52_SYMBOL(a52_samples);
+	LOAD_A52_SYMBOL(a52_syncinfo);
+	LOAD_A52_SYMBOL(a52_frame);
+	LOAD_A52_SYMBOL(a52_block);
+	LOAD_A52_SYMBOL(a52_free);
+
+#undef LOAD_A52_SYMBOL
+
+	printf("libdreamdvd: soft ac3 decoding is available, liba52.so.0 loaded\n");
+	return 1;
+
+error:
+	ddvd_close_liba52();
+	return 0;
 }
 
 // close dynamically loaded liba52.so.0
 
-void ddvd_close_liba52()
+void ddvd_close_liba52(void)
 {
-	dlclose(a52_handle);
+	if (a52_handle != NULL)
+		dlclose(a52_handle);
+	a52_handle = NULL;
+	ddvd_a52_init = NULL;
+	ddvd_a52_samples = NULL;
+	ddvd_a52_syncinfo = NULL;
+	ddvd_a52_frame = NULL;
+	ddvd_a52_block = NULL;
+	ddvd_a52_free = NULL;
 }
 
-// convert 32bit samples to 16bit
+// convert normalized liba52 samples to signed 16bit PCM
 
-static inline int16_t a52_convert (int32_t i)
+static inline int16_t a52_convert(sample_t sample)
 {
-    i >>= 15;
-    return (i > 32767) ? 32767 : ((i < -32768) ? -32768 : i);
+	if (!isfinite(sample))
+		return 0;
+	if (sample >= 1.0)
+		return INT16_MAX;
+	if (sample <= -1.0)
+		return INT16_MIN;
+	return (int16_t)lrint((double)sample * 32768.0);
 }
 
 // liba52 gives us 256 samples left - 256 samples right
@@ -94,11 +119,10 @@ static inline int16_t a52_convert (int32_t i)
 static void a52_convert2s16_2 (sample_t * _f, int16_t * s16)
 {
     int i;
-    int32_t * f = (int32_t *) _f;
 
     for (i = 0; i < 256; i++) {
-	s16[2*i] = a52_convert (f[i]);
-	s16[2*i+1] = a52_convert (f[i+256]);
+	s16[2*i] = a52_convert (_f[i]);
+	s16[2*i+1] = a52_convert (_f[i+256]);
     }
 }
 
@@ -132,7 +156,7 @@ int ddvd_ac3_decode(const uint8_t *input, unsigned int len, int16_t *output)
 	    if (bufpos == buf + 7) {
 		int length;
 
-		length = a52_syncinfo (buf, &flags, &sample_rate, &bit_rate);
+		length = ddvd_a52_syncinfo (buf, &flags, &sample_rate, &bit_rate);
 		if (!length) {
 		    for (bufptr = buf; bufptr < buf + 6; bufptr++)
 			bufptr[0] = bufptr[1];
@@ -140,22 +164,22 @@ int ddvd_ac3_decode(const uint8_t *input, unsigned int len, int16_t *output)
 		}
 		bufpos = buf + length;
 	    } else {
-		level_t level;
+		sample_t level;
 		sample_t bias;
 		int i;
 
 		flags=A52_DOLBY|A52_ADJUST_LEVEL;
 			
-		bias=0;
-		level=(1 << 26);
+		bias = 0.0;
+		level = 1.0;
 
-		if (a52_frame (state, buf, &flags, &level, bias))
+		if (ddvd_a52_frame (state, buf, &flags, &level, bias))
 		    goto error;
 
 		for (i = 0; i < 6; i++) {
-		    if (a52_block (state))
+		    if (ddvd_a52_block (state))
 			goto error;
-			a52_convert2s16_2(a52_samples(state),output);
+			a52_convert2s16_2(ddvd_a52_samples(state),output);
 			output+=512;
 			out_len+=1024;
 		}

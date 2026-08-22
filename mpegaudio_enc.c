@@ -330,12 +330,8 @@ static void ddvd_mpa_compute_scale_factors(unsigned char ddvd_mpa_scale_code[SBL
                    use at most 2 compares to find the index */
                 index = (21 - n) * 3 - 3;
                 if (index >= 0) {
-                    /* bound the loop: index+1 must stay within the
-                       64-entry table. On some hardware (Hisilicon
-                       boxes w/ missing STC/sync drivers) vmax can
-                       end up smaller than every remaining table
-                       entry, overrunning the array and tripping the
-                       assert below with SIGABRT. */
+                    /* Bound the loop: index+1 must stay within the
+                       64-entry table and value 63 is forbidden. */
                     while (index < 62 &&
                            vmax <= ddvd_mpa_scale_factor_table[index+1])
                         index++;
@@ -353,7 +349,7 @@ static void ddvd_mpa_compute_scale_factors(unsigned char ddvd_mpa_scale_code[SBL
                    j, i, vmax, ddvd_mpa_scale_factor_table[index], index);
 #endif
             /* store the scale factor */
-            assert(index >=0 && index <= 63);
+            assert(index >= 0 && index <= 62);
             sf[i] = index;
         }
 
@@ -694,4 +690,3 @@ int ddvd_mpa_encode_frame(unsigned char *frame, int buf_size, void *data)
     ddvd_mpa_nb_samples += MPA_FRAME_SIZE;
     return ddvd_mpa_pbBufPtr(&pb) - pb.buf;
 }
-

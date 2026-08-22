@@ -64,19 +64,58 @@ static ssize_t safe_write(int fd, const void *buf, size_t count)
 }
 
 
-static void write_string(const char *filename, const char *string)
+#if CONFIG_API_VERSION == 3
+
+#define DDVD_OFFSET_VALUE_SIZE 32
+
+struct ddvd_decoder_offset {
+	const char *path;
+	char previous[DDVD_OFFSET_VALUE_SIZE];
+	int changed;
+};
+
+static struct ddvd_decoder_offset ddvd_decoder_offsets[] = {
+	{ "/proc/stb/pcr/pcr_stc_offset", "", 0 },
+	{ "/proc/stb/vmpeg/0/sync_offset", "", 0 }
+};
+
+static int read_string(const char *filename, char *string, size_t size)
+{
+	FILE *f = fopen(filename, "r");
+	if (f == NULL)
+		return -1;
+
+	if (fgets(string, size, f) == NULL) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	string[strcspn(string, "\r\n")] = '\0';
+
+	return string[0] == '\0' ? -1 : 0;
+}
+
+static int write_string(const char *filename, const char *string)
 {
 	FILE *f;
+	int result;
 
 	f = fopen(filename, "w");
 	if (f == NULL) {
 		Perror(filename);
-		return;
+		return -1;
 	}
 
-	fputs(string, f);
-	fclose(f);
+	result = fputs(string, f);
+	if (fclose(f) != 0 || result == EOF) {
+		Perror(filename);
+		return -1;
+	}
+
+	return 0;
 }
+
+#endif
 
 
 static int open_pipe(int fd[2])
@@ -632,6 +671,7 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 	int msg;
 	// try to load liba52.so.0 for softdecoding
 	int have_liba52 = ddvd_load_liba52();
+	state = NULL;
 	int audio_lock = 0;
 	int spu_lock = 0;
 
@@ -827,8 +867,15 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 
 	int ac3thru = 1;
 	if (have_liba52) {
-		state = a52_init(0);	//init AC3 Decoder
-		ac3thru = playerconfig->ac3thru;
+		state = ddvd_a52_init(0);	//init AC3 Decoder
+		if (state != NULL) {
+			ac3thru = playerconfig->ac3thru;
+		}
+		else {
+			Debug(0, "Could not initialize liba52; using AC3 pass-through\n");
+			ddvd_close_liba52();
+			have_liba52 = 0;
+		}
 	}
 
 	char osdtext[512];
@@ -2731,19 +2778,19 @@ err_dvdnav_open:
 		Perror("VIDEO_SELECT_SOURCE");
 	if (ioctl(ddvd_fdaudio, AUDIO_SELECT_SOURCE, AUDIO_SOURCE_DEMUX) < 0)
 		Perror("AUDIO_SELECT_SOURCE");
-	close(ddvd_ac3_fd);
+	if (ddvd_ac3_fd >= 0)
+		close(ddvd_ac3_fd);
 err_open_ac3_fd:
-	close(ddvd_fdaudio);
+	if (ddvd_fdaudio >= 0 && ddvd_fdaudio != ddvd_ac3_fd)
+		close(ddvd_fdaudio);
 err_open_fdaudio:
-	close(ddvd_fdvideo);
+	if (ddvd_fdvideo >= 0)
+		close(ddvd_fdvideo);
 err_open_fdvideo:
-	close(ddvd_output_fd);
+	if (ddvd_output_fd >= 0 && ddvd_output_fd != ddvd_fdvideo)
+		close(ddvd_output_fd);
+	ddvd_ac3_fd = ddvd_fdaudio = ddvd_fdvideo = ddvd_output_fd = -1;
 err_open_output_fd:
-
-	if (have_liba52) {
-		a52_free(state);
-		ddvd_close_liba52();
-	}
 
 	//Clear Screen
 	blit_area.x_start = blit_area.y_start = 0;
@@ -2772,6 +2819,13 @@ err_malloc:
 		free(ddvd_lbb2);
 	if (last_iframe != NULL)
 		free(last_iframe);
+
+	if (have_liba52) {
+		if (state != NULL)
+			ddvd_a52_free(state);
+		state = NULL;
+		ddvd_close_liba52();
+	}
 
 #if CONFIG_API_VERSION == 3
 	ddvd_unset_pcr_offset();
@@ -3084,7 +3138,7 @@ static struct ddvd_spu_return ddvd_spu_decode_data(char *spu_buf, const uint8_t 
 // blit to argb in 32bit mode
 static void ddvd_blit_to_argb(void *_dst, const void *_src, int pix)
 {
-	unsigned long *dst = _dst;
+	uint32_t *dst = _dst;
 	const unsigned char *src = _src;
 	while (pix--) {
 		int p = (*src++);
@@ -3098,7 +3152,8 @@ static void ddvd_blit_to_argb(void *_dst, const void *_src, int pix)
 			g = ddvd_gn[p] >> 8;
 			b = ddvd_bl[p] >> 8;
 		}
-		*dst++ = (a << 24) | (r << 16) | (g << 8) | (b << 0);
+		*dst++ = ((uint32_t)a << 24) | ((uint32_t)r << 16) |
+			((uint32_t)g << 8) | (uint32_t)b;
 	}
 }
 
@@ -3107,15 +3162,29 @@ static void ddvd_blit_to_argb(void *_dst, const void *_src, int pix)
 // set decoder buffer offsets to a minimum
 static void ddvd_set_pcr_offset(void)
 {
-	write_string("/proc/stb/pcr/pcr_stc_offset", "200");
-	write_string("/proc/stb/vmpeg/0/sync_offset", "200");
+	size_t i;
+
+	for (i = 0; i < sizeof(ddvd_decoder_offsets) / sizeof(ddvd_decoder_offsets[0]); i++) {
+		struct ddvd_decoder_offset *offset = &ddvd_decoder_offsets[i];
+		offset->changed = 0;
+		if (read_string(offset->path, offset->previous, sizeof(offset->previous)) == 0 &&
+			write_string(offset->path, "200") == 0)
+			offset->changed = 1;
+	}
 }
 
-// reset decoder buffer offsets
+// restore decoder buffer offsets to the values found before DVD playback
 static void ddvd_unset_pcr_offset(void)
 {
-	write_string("/proc/stb/pcr/pcr_stc_offset", "2710");
-	write_string("/proc/stb/vmpeg/0/sync_offset", "2710");
+	size_t i;
+
+	for (i = 0; i < sizeof(ddvd_decoder_offsets) / sizeof(ddvd_decoder_offsets[0]); i++) {
+		struct ddvd_decoder_offset *offset = &ddvd_decoder_offsets[i];
+		if (offset->changed) {
+			write_string(offset->path, offset->previous);
+			offset->changed = 0;
+		}
+	}
 }
 
 #endif
@@ -3277,4 +3346,3 @@ struct ddvd_resize_return ddvd_resize_pixmap_1bpp(unsigned char *pixmap, int xso
 
 	return return_code;
 }
-
