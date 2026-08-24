@@ -1778,8 +1778,9 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 		goto err_dvdnav_open;
 	}
 
-	/* set read ahead cache usage to no */
-	if (dvdnav_set_readahead_flag(dvdnav, 0) != DVDNAV_STATUS_OK) {
+	/* Read complete VOBUs ahead so short optical-drive stalls do not
+	 * immediately starve the audio and video decoders. */
+	if (dvdnav_set_readahead_flag(dvdnav, 1) != DVDNAV_STATUS_OK) {
 		Debug(1, "Error on dvdnav_set_readahead_flag: %s\n", dvdnav_err_to_string(dvdnav));
 		res = DDVD_FAIL_PREFS;
 		goto err_dvdnav;
