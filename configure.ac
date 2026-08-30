@@ -21,6 +21,8 @@ AC_CHECK_LIB([dl], [dlopen], [LIBDL_LIBS="-ldl"], [AC_MSG_ERROR([Could not find 
 AC_SUBST(LIBDL_LIBS)
 AC_CHECK_LIB([m], [pow], [LIBM_LIBS="-lm"], [AC_MSG_ERROR([Could not find libm])])
 AC_SUBST(LIBM_LIBS)
+AC_SEARCH_LIBS([pthread_create], [pthread], [],
+	[AC_MSG_ERROR([Could not find pthread support])])
 
 # Checks for header files.
 AC_CHECK_HEADERS([byteswap.h ost/dmx.h linux/dvb/version.h])

@@ -8,15 +8,18 @@
 #include "dreamalsa.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #define DREAM_AUDIO_SINK "/usr/lib/gstreamer-1.0/libgstdreamaudiosink.so"
 #define DREAM_ALSA_RETRY_US 2000
-#define DREAM_ALSA_MAX_RETRIES 20
 #define DREAM_COMPRESSED_BUFFER_SIZE (128 * 1024)
+#define DREAM_AUDIO_QUEUE_SIZE (512 * 1024)
 /* enum AVCodecID keeps its first compressed-audio range stable.  The Dream
  * decoder API deliberately accepts int so its public header stays FFmpeg-free. */
 #define DDVD_AV_CODEC_ID_AC3 0x15003
@@ -75,29 +78,219 @@ static size_t dream_ac3_buffer_size;
 static uint8_t dream_dts_buffer[DREAM_COMPRESSED_BUFFER_SIZE];
 static size_t dream_dts_buffer_size;
 
+struct ddvd_dream_audio_packet {
+	uint8_t *data;
+	size_t size;
+	unsigned int sample_rate;
+	unsigned int channels;
+	int passthrough;
+	struct ddvd_dream_audio_packet *next;
+};
+
+static pthread_t dream_audio_queue_thread;
+static pthread_mutex_t dream_audio_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dream_audio_queue_cond = PTHREAD_COND_INITIALIZER;
+static struct ddvd_dream_audio_packet *dream_audio_queue_head;
+static struct ddvd_dream_audio_packet *dream_audio_queue_tail;
+static size_t dream_audio_queue_bytes;
+static int dream_audio_queue_running;
+static int dream_audio_queue_stop_requested;
+static int dream_audio_queue_paused;
+static int dream_audio_queue_failed;
+
+static int ddvd_dream_audio_queue_stopping(void)
+{
+	int stopping;
+
+	pthread_mutex_lock(&dream_audio_queue_mutex);
+	stopping = dream_audio_queue_stop_requested;
+	pthread_mutex_unlock(&dream_audio_queue_mutex);
+	return stopping;
+}
+
 static int ddvd_dream_alsa_write_all(const uint8_t *data, size_t size)
 {
 	size_t written = 0;
-	int retries = 0;
 
 	while (written < size) {
-		int result = dream_alsa_write(dream_alsa, data + written,
+		int result;
+
+		if (ddvd_dream_audio_queue_stopping())
+			break;
+		result = dream_alsa_write(dream_alsa, data + written,
 			size - written, -1);
 
 		if (result < 0)
 			return written ? (int)written : -1;
 		if (result == 0) {
-			if (++retries >= DREAM_ALSA_MAX_RETRIES)
-				break;
 			usleep(DREAM_ALSA_RETRY_US);
 			continue;
 		}
 		if ((size_t)result > size - written)
 			return written ? (int)written : -1;
 		written += (size_t)result;
-		retries = 0;
 	}
 	return (int)written;
+}
+
+static void ddvd_dream_audio_queue_clear_locked(void)
+{
+	while (dream_audio_queue_head != NULL) {
+		struct ddvd_dream_audio_packet *packet = dream_audio_queue_head;
+
+		dream_audio_queue_head = packet->next;
+		free(packet->data);
+		free(packet);
+	}
+	dream_audio_queue_tail = NULL;
+	dream_audio_queue_bytes = 0;
+}
+
+static int ddvd_dream_alsa_configure(unsigned int sample_rate,
+	unsigned int channels, int passthrough)
+{
+	if (dream_alsa_configured && dream_alsa_rate == sample_rate &&
+		dream_alsa_channels == channels &&
+		dream_alsa_passthrough == passthrough)
+		return 0;
+
+	if (dream_alsa_configured)
+		dream_alsa_drop(dream_alsa);
+	if (dream_alsa_set_params(dream_alsa, sample_rate, channels, 2,
+		passthrough) < 0)
+		return -1;
+	dream_alsa_configured = 1;
+	dream_alsa_rate = sample_rate;
+	dream_alsa_channels = channels;
+	dream_alsa_passthrough = passthrough;
+	return 0;
+}
+
+static void *ddvd_dream_audio_queue_worker(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		struct ddvd_dream_audio_packet *packet;
+		int result;
+
+		pthread_mutex_lock(&dream_audio_queue_mutex);
+		while (!dream_audio_queue_stop_requested &&
+			(dream_audio_queue_paused || dream_audio_queue_head == NULL))
+			pthread_cond_wait(&dream_audio_queue_cond,
+				&dream_audio_queue_mutex);
+		if (dream_audio_queue_stop_requested) {
+			pthread_mutex_unlock(&dream_audio_queue_mutex);
+			break;
+		}
+
+		packet = dream_audio_queue_head;
+		dream_audio_queue_head = packet->next;
+		if (dream_audio_queue_head == NULL)
+			dream_audio_queue_tail = NULL;
+		dream_audio_queue_bytes -= packet->size;
+		pthread_cond_broadcast(&dream_audio_queue_cond);
+		pthread_mutex_unlock(&dream_audio_queue_mutex);
+
+		result = ddvd_dream_alsa_configure(packet->sample_rate,
+			packet->channels, packet->passthrough);
+		if (result == 0)
+			result = ddvd_dream_alsa_write_all(packet->data, packet->size);
+		free(packet->data);
+		free(packet);
+		if (result < 0) {
+			pthread_mutex_lock(&dream_audio_queue_mutex);
+			dream_audio_queue_failed = 1;
+			dream_audio_queue_stop_requested = 1;
+			pthread_cond_broadcast(&dream_audio_queue_cond);
+			pthread_mutex_unlock(&dream_audio_queue_mutex);
+			break;
+		}
+	}
+	return NULL;
+}
+
+static int ddvd_dream_audio_queue_start(void)
+{
+	int result;
+
+	if (dream_audio_queue_running)
+		return 0;
+	pthread_mutex_lock(&dream_audio_queue_mutex);
+	ddvd_dream_audio_queue_clear_locked();
+	dream_audio_queue_stop_requested = 0;
+	dream_audio_queue_paused = 0;
+	dream_audio_queue_failed = 0;
+	pthread_mutex_unlock(&dream_audio_queue_mutex);
+
+	result = pthread_create(&dream_audio_queue_thread, NULL,
+		ddvd_dream_audio_queue_worker, NULL);
+	if (result != 0) {
+		errno = result;
+		fprintf(stderr, "libdreamdvd: cannot start Dream audio queue: %s\n",
+			strerror(errno));
+		return -1;
+	}
+	dream_audio_queue_running = 1;
+	return 0;
+}
+
+static void ddvd_dream_audio_queue_stop(void)
+{
+	if (dream_audio_queue_running) {
+		pthread_mutex_lock(&dream_audio_queue_mutex);
+		dream_audio_queue_stop_requested = 1;
+		dream_audio_queue_paused = 0;
+		pthread_cond_broadcast(&dream_audio_queue_cond);
+		pthread_mutex_unlock(&dream_audio_queue_mutex);
+		pthread_join(dream_audio_queue_thread, NULL);
+		dream_audio_queue_running = 0;
+	}
+	pthread_mutex_lock(&dream_audio_queue_mutex);
+	ddvd_dream_audio_queue_clear_locked();
+	pthread_mutex_unlock(&dream_audio_queue_mutex);
+}
+
+static int ddvd_dream_audio_queue_packet(const uint8_t *data, size_t size,
+	unsigned int sample_rate, unsigned int channels, int passthrough)
+{
+	struct ddvd_dream_audio_packet *packet;
+
+	packet = malloc(sizeof(*packet));
+	if (packet == NULL)
+		return -1;
+	packet->data = malloc(size);
+	if (packet->data == NULL) {
+		free(packet);
+		return -1;
+	}
+	memcpy(packet->data, data, size);
+	packet->size = size;
+	packet->sample_rate = sample_rate;
+	packet->channels = channels;
+	packet->passthrough = passthrough;
+	packet->next = NULL;
+
+	pthread_mutex_lock(&dream_audio_queue_mutex);
+	while (!dream_audio_queue_stop_requested &&
+		!dream_audio_queue_failed && dream_audio_queue_bytes != 0 &&
+		dream_audio_queue_bytes + size > DREAM_AUDIO_QUEUE_SIZE)
+		pthread_cond_wait(&dream_audio_queue_cond,
+			&dream_audio_queue_mutex);
+	if (dream_audio_queue_stop_requested || dream_audio_queue_failed) {
+		pthread_mutex_unlock(&dream_audio_queue_mutex);
+		free(packet->data);
+		free(packet);
+		return -1;
+	}
+	if (dream_audio_queue_tail != NULL)
+		dream_audio_queue_tail->next = packet;
+	else
+		dream_audio_queue_head = packet;
+	dream_audio_queue_tail = packet;
+	dream_audio_queue_bytes += size;
+	pthread_cond_broadcast(&dream_audio_queue_cond);
+	pthread_mutex_unlock(&dream_audio_queue_mutex);
+	return (int)size;
 }
 
 /* AC-3 frame sizes in 16-bit words for 48, 44.1 and 32 kHz.  DVD private
@@ -153,21 +346,11 @@ static void ddvd_dream_audio_output(
 	if (dream_alsa == NULL || data == NULL || size == 0)
 		return;
 
-	if (!dream_alsa_configured || dream_alsa_rate != sample_rate ||
-		dream_alsa_channels != channels ||
-		dream_alsa_passthrough != passthrough) {
-		if (dream_alsa_set_params(dream_alsa, sample_rate, channels, 2,
-			passthrough) < 0)
-			return;
-		dream_alsa_configured = 1;
-		dream_alsa_rate = sample_rate;
-		dream_alsa_channels = channels;
-		dream_alsa_passthrough = passthrough;
-	}
-
-	/* Do not give it the discontinuous DVD PTS; video is independently
-	 * freerunning.  The helper completes short non-blocking writes. */
-	ddvd_dream_alsa_write_all(data, size);
+	/* Keep decoded audio off the dvdnav thread.  Together with the video queue
+	 * this gives dvdnav's VOBU read-ahead enough time to build a reserve that
+	 * masks short optical-drive seeks and retries. */
+	ddvd_dream_audio_queue_packet(data, size, sample_rate, channels,
+		passthrough);
 }
 
 static int ddvd_dream_alsa_symbol(void **symbol, const char *name)
@@ -223,6 +406,8 @@ int ddvd_dream_alsa_open(void)
 	dream_alsa_rate = 0;
 	dream_alsa_channels = 0;
 	dream_alsa_passthrough = 0;
+	if (ddvd_dream_audio_queue_start() < 0)
+		goto error;
 	return 0;
 
 error:
@@ -438,18 +623,8 @@ int ddvd_dream_alsa_write_pcm(const int16_t *data, size_t size, int64_t pts)
 		return 0;
 	if (dream_alsa == NULL && ddvd_dream_alsa_open() < 0)
 		return -1;
-	if (!dream_alsa_configured) {
-		if (dream_alsa_set_params(dream_alsa, 48000, 2, 2, 0) < 0)
-			return -1;
-		dream_alsa_configured = 1;
-	}
-
-	/* libdreamdvd already paces the interleaved DVD stream against its video
-	 * PTS.  Do not run dreamaudiosink's broadcast/HLS VPTS anchor here: the
-	 * private frame path has no kernel APTS and changes PTS epoch at DVD menu
-	 * transitions.  Retry EAGAIN briefly so a full ALSA period is not dropped,
-	 * but retain a hard bound to keep the video producer deadlock-free. */
-	return ddvd_dream_alsa_write_all((const uint8_t *)data, size);
+	return ddvd_dream_audio_queue_packet((const uint8_t *)data, size,
+		48000, 2, 0);
 }
 
 void ddvd_dream_alsa_reset(void)
@@ -458,14 +633,33 @@ void ddvd_dream_alsa_reset(void)
 	dream_dts_buffer_size = 0;
 	if (dream_alsa == NULL)
 		return;
+	ddvd_dream_audio_queue_stop();
 	dream_alsa_drop(dream_alsa);
 	dream_alsa_reset_anchor(dream_alsa);
+	if (ddvd_dream_audio_queue_start() < 0)
+		fprintf(stderr, "libdreamdvd: cannot restart Dream audio queue\n");
+}
+
+void ddvd_dream_alsa_pause(void)
+{
+	pthread_mutex_lock(&dream_audio_queue_mutex);
+	dream_audio_queue_paused = 1;
+	pthread_mutex_unlock(&dream_audio_queue_mutex);
+}
+
+void ddvd_dream_alsa_resume(void)
+{
+	pthread_mutex_lock(&dream_audio_queue_mutex);
+	dream_audio_queue_paused = 0;
+	pthread_cond_broadcast(&dream_audio_queue_cond);
+	pthread_mutex_unlock(&dream_audio_queue_mutex);
 }
 
 void ddvd_dream_alsa_close(void)
 {
 	dream_ac3_buffer_size = 0;
 	dream_dts_buffer_size = 0;
+	ddvd_dream_audio_queue_stop();
 	if (dream_decoder != NULL && dream_decoder_free != NULL)
 		dream_decoder_free(dream_decoder);
 	dream_decoder = NULL;
