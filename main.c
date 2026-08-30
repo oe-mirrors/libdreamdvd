@@ -1030,8 +1030,9 @@ static void ddvd_dream_aml_stop(void)
 
 static int ddvd_dream_aml_active;
 
-static int ddvd_dream_aml_prepare(void)
+static int ddvd_dream_aml_prepare(const char *dvd_path)
 {
+	(void)dvd_path;
 	return 0;
 }
 
