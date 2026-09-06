@@ -5,6 +5,7 @@ lib_LTLIBRARIES = libdreamdvd.la
 libdreamdvd_la_SOURCES = \
 	dreamalsa.c \
 	dreamalsa.h \
+	dreamsync.h \
 	logo.h \
 	main.c \
 	main.h \

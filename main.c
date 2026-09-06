@@ -147,6 +147,9 @@ static int write_string(const char *filename, const char *string)
 #if defined(__aarch64__)
 
 #include <pthread.h>
+#include <time.h>
+
+#include "dreamsync.h"
 
 /*
  * Dreambox One/Two use a private Amlogic frame injection ABI.  Their DVB
@@ -161,7 +164,6 @@ static int write_string(const char *filename, const char *string)
 #define DDVD_DREAM_AML_FREERUN_MODE      "/sys/class/video/freerun_mode"
 #define DDVD_DREAM_AML_TSYNC_ENABLE      "/sys/class/tsync/enable"
 #define DDVD_DREAM_DEFAULT_FRAME_PTS      UINT64_C(3600)
-#define DDVD_DREAM_PACING_LEAD_MS        UINT64_C(600)
 #define DDVD_DREAM_BACKPRESSURE_MS        500
 #define DDVD_DREAM_MPEG2_PACKET_MAX_SIZE (2 * 1024 * 1024)
 #define DDVD_DREAM_VIDEO_QUEUE_FRAMES     32
@@ -219,10 +221,18 @@ static uint8_t *ddvd_dream_aml_packet_data;
 static size_t ddvd_dream_aml_packet_size;
 static size_t ddvd_dream_aml_packet_capacity;
 static uint64_t ddvd_dream_aml_output_pts;
-static uint64_t ddvd_dream_aml_frame_pts_step;
+static uint64_t ddvd_dream_aml_frame_pts_step4;
+static unsigned int ddvd_dream_aml_frame_pts_remainder;
 static int ddvd_dream_aml_pacing_valid;
 static uint64_t ddvd_dream_aml_pacing_pts;
 static uint64_t ddvd_dream_aml_pacing_time;
+static unsigned int ddvd_dream_aml_pacing_generation;
+static unsigned int ddvd_dream_aml_pacing_seen_generation;
+static unsigned int ddvd_dream_aml_pacing_remainder;
+static struct ddvd_dream_sync ddvd_dream_aml_sync;
+static uint64_t ddvd_dream_aml_sync_time;
+static uint32_t ddvd_dream_aml_sync_last_video;
+static int64_t ddvd_dream_aml_sync_adjustment;
 static int ddvd_dream_aml_queued_output;
 static pthread_t ddvd_dream_aml_queue_thread;
 static pthread_mutex_t ddvd_dream_aml_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -284,65 +294,128 @@ static int ddvd_dream_aml_reserve_packet(size_t size)
 
 static void ddvd_dream_aml_reset_pacing(void)
 {
-	ddvd_dream_aml_pacing_valid = 0;
+	/* Navigation must not modify the worker's clock state while it sleeps. */
+	pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
+	++ddvd_dream_aml_pacing_generation;
+	pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
 }
 
 static void ddvd_dream_aml_reset_timeline(void)
 {
 	/* Parts of the Amlogic driver use zero as "timestamp unavailable". */
 	ddvd_dream_aml_output_pts = 90000;
-	ddvd_dream_aml_frame_pts_step = DDVD_DREAM_DEFAULT_FRAME_PTS;
+	ddvd_dream_aml_frame_pts_step4 = DDVD_DREAM_DEFAULT_FRAME_PTS * 4;
+	ddvd_dream_aml_frame_pts_remainder = 0;
 	ddvd_dream_aml_reset_pacing();
 }
 
-static void ddvd_dream_aml_pace(uint64_t pts)
+static uint64_t ddvd_dream_aml_time(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+
+static int64_t ddvd_dream_aml_sync_feedback(uint64_t now, int64_t frame_us)
+{
+	int64_t audio_pts;
+	unsigned int generation;
+	unsigned long long video_pts = 0;
+	int64_t error;
+
+	if (now < ddvd_dream_aml_sync_time)
+		return ddvd_dream_aml_sync_adjustment;
+	ddvd_dream_aml_sync_time = now + 100000; /* Ten samples/s, not per PES. */
+	if (!ddvd_dream_alsa_get_clock(&audio_pts, &generation) ||
+		ioctl(ddvd_fdvideo, VIDEO_GET_PTS, &video_pts) < 0 || !video_pts) {
+		ddvd_dream_aml_sync_adjustment = 0;
+		return 0;
+	}
+	/* Avoid anchoring to the old still/menu picture before the decoder has
+	 * presented the first picture from the new stream. */
+	if (!ddvd_dream_aml_sync_last_video ||
+		ddvd_dream_aml_sync_last_video == (uint32_t)video_pts) {
+		ddvd_dream_aml_sync_last_video = (uint32_t)video_pts;
+		return ddvd_dream_aml_sync_adjustment;
+	}
+	ddvd_dream_aml_sync_last_video = (uint32_t)video_pts;
+	error = ddvd_dream_sync_error(&ddvd_dream_aml_sync,
+		(uint32_t)video_pts, audio_pts, generation);
+	ddvd_dream_aml_sync_adjustment =
+		ddvd_dream_sync_adjustment(error, frame_us);
+	return ddvd_dream_aml_sync_adjustment;
+}
+
+static int ddvd_dream_aml_pace(uint64_t pts)
 {
 	uint64_t target;
-	uint64_t now;
+	uint64_t now = ddvd_dream_aml_time();
+	uint64_t ticks;
+	int64_t frame_us;
+	unsigned int generation;
 
+	pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
+	generation = ddvd_dream_aml_pacing_generation;
+	pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
+	if (generation != ddvd_dream_aml_pacing_seen_generation) {
+		ddvd_dream_aml_pacing_seen_generation = generation;
+		ddvd_dream_aml_pacing_valid = 0;
+		ddvd_dream_aml_pacing_remainder = 0;
+		memset(&ddvd_dream_aml_sync, 0, sizeof(ddvd_dream_aml_sync));
+		ddvd_dream_aml_sync_time = 0;
+		ddvd_dream_aml_sync_last_video = 0;
+		ddvd_dream_aml_sync_adjustment = 0;
+	}
 	if (!ddvd_dream_aml_pacing_valid || pts < ddvd_dream_aml_pacing_pts) {
 		ddvd_dream_aml_pacing_valid = 1;
 		ddvd_dream_aml_pacing_pts = pts;
-		ddvd_dream_aml_pacing_time = ddvd_get_time();
-		return;
+		ddvd_dream_aml_pacing_time = now;
+		return 1;
 	}
+	/* Keep sub-millisecond fractions. Rounding each 29.97 fps picture to
+	 * 33 ms used to gain almost one second every hundred seconds. */
+	ticks = (pts - ddvd_dream_aml_pacing_pts) * 100 +
+		ddvd_dream_aml_pacing_remainder;
+	frame_us = ticks / 9;
+	ddvd_dream_aml_pacing_remainder = ticks % 9;
+	if (frame_us > 100000 || !frame_us)
+		frame_us = 40000;
+	target = ddvd_dream_aml_pacing_time + frame_us +
+		ddvd_dream_aml_sync_feedback(now, frame_us);
+	/* A late VOBU must not turn into a burst. Feedback gently recovers the
+	 * lost time against played audio on subsequent pictures (at most 5%). */
+	if (target < now)
+		target = now;
 
-	if (ddvd_dream_aml_queued_output) {
-		/* DVD navigation exposes video in VOBU/GOP-sized groups.  Do not catch
-		 * up late groups in a burst: re-anchor a late picture and keep all
-		 * following pictures on their frame timeline. */
-		now = ddvd_get_time();
-		target = ddvd_dream_aml_pacing_time +
-			(pts - ddvd_dream_aml_pacing_pts) / 90;
-		if (target < now)
-			target = now;
-		while ((now = ddvd_get_time()) < target) {
-			uint64_t wait_ms = target - now;
-
-			if (wait_ms > 20)
-				wait_ms = 20;
-			usleep((useconds_t)wait_ms * 1000);
-		}
-		ddvd_dream_aml_pacing_pts = pts;
-		ddvd_dream_aml_pacing_time = target;
-		return;
-	}
-
-	target = ddvd_dream_aml_pacing_time +
-		(pts - ddvd_dream_aml_pacing_pts) / 90;
 	for (;;) {
-		uint64_t wait_ms;
+		uint64_t wait_us;
+		int interrupted;
+		int paused = 0;
 
-		now = ddvd_get_time();
-		if (target <= now + DDVD_DREAM_PACING_LEAD_MS)
+		pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
+		while (!ddvd_dream_aml_queue_stop_requested &&
+			ddvd_dream_aml_queue_paused) {
+			paused = 1;
+			pthread_cond_wait(&ddvd_dream_aml_queue_cond,
+				&ddvd_dream_aml_queue_mutex);
+		}
+		interrupted = ddvd_dream_aml_queue_stop_requested;
+		pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
+		if (interrupted)
+			return 0;
+		now = ddvd_dream_aml_time();
+		if (paused)
+			target = now; /* Keep the picture; never drop an MPEG reference. */
+		if (target <= now)
 			break;
-		wait_ms = target - now - DDVD_DREAM_PACING_LEAD_MS;
-		/* Recompute after short sleeps.  This keeps menu/navigation input
-		 * responsive and avoids the accumulated-lead bug of the first pacer. */
-		if (wait_ms > 20)
-			wait_ms = 20;
-		usleep((useconds_t)wait_ms * 1000);
+		wait_us = target - now;
+		if (wait_us > 10000)
+			wait_us = 10000;
+		usleep((useconds_t)wait_us);
 	}
+	ddvd_dream_aml_pacing_pts = pts;
+	ddvd_dream_aml_pacing_time = target;
+	return 1;
 }
 
 static uint64_t ddvd_dream_aml_logical_pts(uint64_t dvd_pts,
@@ -369,9 +442,9 @@ static void ddvd_dream_aml_resume_clock(void)
 	if (!ddvd_dream_aml_active)
 		return;
 
-	/* PCM is rendered by the separate ALSA device and therefore cannot
-	 * provide the vendor DVB decoder with an APTS clock.  Keep video in
-	 * freerun mode and let the interleaved DVD PTS pacing above be the clock. */
+	/* ALSA does not feed the vendor DVB APTS/PCR clock. Enabling tsync with
+	 * that missing clock can freeze a menu or the first movie frame. Keep
+	 * private decoder PTS continuous and pace against played ALSA samples. */
 	if (ddvd_write_number(DDVD_DREAM_AML_TSYNC_ENABLE, 0) < 0)
 		Perror(DDVD_DREAM_AML_TSYNC_ENABLE);
 	if (ddvd_write_number(DDVD_DREAM_AML_FREERUN_MODE, 1) < 0)
@@ -573,17 +646,15 @@ static uint32_t ddvd_dream_aml_frame_duration(uint8_t frame_rate_code)
 		durations[frame_rate_code] : durations[0];
 }
 
-static uint64_t ddvd_dream_aml_frame_pts_duration(uint8_t frame_rate_code)
+static uint64_t ddvd_dream_aml_frame_pts_duration4(uint8_t frame_rate_code)
 {
-	/* 90 kHz picture durations for the MPEG-2 frame_rate_code values.  The
-	 * fractional NTSC rates are rounded on alternate pictures by the decoder;
-	 * DVD PAL uses the exact 3600-tick entry. */
+	/* Quarter ticks retain the exact 23.976 and 59.94 Hz durations. */
 	static const uint16_t durations[] = {
-		3003, 3754, 3750, 3600, 3003, 3000, 1800, 1502, 1500
+		12012, 15015, 15000, 14400, 12012, 12000, 7200, 6006, 6000
 	};
 
 	return frame_rate_code < sizeof(durations) / sizeof(durations[0]) ?
-		durations[frame_rate_code] : DDVD_DREAM_DEFAULT_FRAME_PTS;
+		durations[frame_rate_code] : DDVD_DREAM_DEFAULT_FRAME_PTS * 4;
 }
 
 static int ddvd_dream_aml_start_decoder(const uint8_t *data, size_t size)
@@ -633,8 +704,8 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 	const uint8_t *sequence = ddvd_find_mpeg_sequence_header(data, size);
 
 	if (sequence != NULL && !ddvd_dream_aml_queued_output)
-		ddvd_dream_aml_frame_pts_step =
-			ddvd_dream_aml_frame_pts_duration(sequence[7] & 0x0f);
+		ddvd_dream_aml_frame_pts_step4 =
+			ddvd_dream_aml_frame_pts_duration4(sequence[7] & 0x0f);
 
 	if (!ddvd_dream_aml_decoder_started) {
 		/* A resume position can start between GOPs.  Wait for the next MPEG
@@ -646,7 +717,8 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 			return -1;
 	}
 
-	ddvd_dream_aml_pace(pts);
+	if (!ddvd_dream_aml_pace(pts))
+		return 0;
 	memset(&frame, 0, sizeof(frame));
 	/* The normalized timestamp gives Amlogic a proper presentation anchor for
 	 * every grouped MPEG-2 block without exposing DVD cell/VOB clock jumps. */
@@ -788,6 +860,19 @@ static void *ddvd_dream_aml_queue_worker(void *unused)
 
 		result = ddvd_dream_aml_submit_packet(packet->data,
 			packet->size, packet->pts);
+		if (result == 0) {
+			/* Stop interrupted pacing before this picture was submitted.
+			 * Return it to the head so queue_clear reuses its PTS at the
+			 * next menu/cell, without leaving a gap in the driver timeline. */
+			pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
+			packet->next = ddvd_dream_aml_queue_head;
+			ddvd_dream_aml_queue_head = packet;
+			if (ddvd_dream_aml_queue_tail == NULL)
+				ddvd_dream_aml_queue_tail = packet;
+			++ddvd_dream_aml_queue_count;
+			pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
+			break;
+		}
 		free(packet->data);
 		free(packet);
 		if (result < 0) {
@@ -959,8 +1044,8 @@ static ssize_t ddvd_dream_aml_write_es(const uint8_t *data, size_t size,
 		sequence = ddvd_find_mpeg_sequence_header(
 			ddvd_dream_aml_packet_data, next_picture);
 		if (sequence != NULL)
-			ddvd_dream_aml_frame_pts_step =
-				ddvd_dream_aml_frame_pts_duration(sequence[7] & 0x0f);
+			ddvd_dream_aml_frame_pts_step4 =
+				ddvd_dream_aml_frame_pts_duration4(sequence[7] & 0x0f);
 
 		if (ddvd_dream_aml_queued_output)
 			result = ddvd_dream_aml_queue_packet(
@@ -972,7 +1057,9 @@ static ssize_t ddvd_dream_aml_write_es(const uint8_t *data, size_t size,
 				ddvd_dream_aml_output_pts);
 		if (result < 0)
 			return -1;
-		ddvd_dream_aml_output_pts += ddvd_dream_aml_frame_pts_step;
+		ddvd_dream_aml_frame_pts_remainder += ddvd_dream_aml_frame_pts_step4;
+		ddvd_dream_aml_output_pts += ddvd_dream_aml_frame_pts_remainder / 4;
+		ddvd_dream_aml_frame_pts_remainder %= 4;
 		memmove(ddvd_dream_aml_packet_data,
 			ddvd_dream_aml_packet_data + next_picture,
 			ddvd_dream_aml_packet_size - next_picture);

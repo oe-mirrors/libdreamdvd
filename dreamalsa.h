@@ -12,5 +12,8 @@ void ddvd_dream_alsa_reset(void);
 void ddvd_dream_alsa_pause(void);
 void ddvd_dream_alsa_resume(void);
 void ddvd_dream_alsa_close(void);
+/* Played PCM time (90 kHz), including ALSA latency. No ALSA calls are made
+ * from the reader's thread. Returns 0 when absent, paused or starved. */
+int ddvd_dream_alsa_get_clock(int64_t *pts, unsigned int *generation);
 
 #endif
