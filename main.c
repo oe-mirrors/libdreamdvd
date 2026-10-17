@@ -144,12 +144,18 @@ static int write_string(const char *filename, const char *string)
 	return 0;
 }
 
+/* Audio goes to the decoder of the dreamaudiod service as PES, like to any
+ * DVB audio decoder.  The kernel plays it and reports the played PTS. */
+static int ddvd_dream_audio_service;
+
 #if defined(__aarch64__)
 
 #include <pthread.h>
 #include <time.h>
 
 #include "dreamsync.h"
+
+static unsigned int ddvd_dream_audio_generation;
 
 /*
  * Dreambox One/Two use a private Amlogic frame injection ABI.  Their DVB
@@ -316,6 +322,20 @@ static uint64_t ddvd_dream_aml_time(void)
 	return (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
 }
 
+/* the PTS of the audio playing now */
+static int ddvd_dream_audio_clock(int64_t *pts, unsigned int *generation)
+{
+	uint64_t played = 0;
+
+	if (!ddvd_dream_audio_service)
+		return ddvd_dream_alsa_get_clock(pts, generation);
+	if (ioctl(ddvd_fdaudio, AUDIO_GET_PTS, &played) < 0 || !played)
+		return 0;
+	*pts = (int64_t)(played & UINT64_C(0x1ffffffff));
+	*generation = ddvd_dream_audio_generation;
+	return 1;
+}
+
 static int64_t ddvd_dream_aml_sync_feedback(uint64_t now, int64_t frame_us)
 {
 	int64_t audio_pts;
@@ -326,7 +346,7 @@ static int64_t ddvd_dream_aml_sync_feedback(uint64_t now, int64_t frame_us)
 	if (now < ddvd_dream_aml_sync_time)
 		return ddvd_dream_aml_sync_adjustment;
 	ddvd_dream_aml_sync_time = now + 100000; /* Ten samples/s, not per PES. */
-	if (!ddvd_dream_alsa_get_clock(&audio_pts, &generation) ||
+	if (!ddvd_dream_audio_clock(&audio_pts, &generation) ||
 		ioctl(ddvd_fdvideo, VIDEO_GET_PTS, &video_pts) < 0 || !video_pts) {
 		ddvd_dream_aml_sync_adjustment = 0;
 		return 0;
@@ -975,7 +995,10 @@ static void ddvd_dream_aml_pause_output(void)
 {
 	if (!ddvd_dream_aml_queued_output)
 		return;
-	ddvd_dream_alsa_pause();
+	if (ddvd_dream_audio_service)
+		++ddvd_dream_audio_generation;
+	else
+		ddvd_dream_alsa_pause();
 	pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
 	ddvd_dream_aml_queue_paused = 1;
 	pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
@@ -985,7 +1008,10 @@ static void ddvd_dream_aml_resume_output(void)
 {
 	if (!ddvd_dream_aml_queued_output)
 		return;
-	ddvd_dream_alsa_resume();
+	if (ddvd_dream_audio_service)
+		++ddvd_dream_audio_generation;
+	else
+		ddvd_dream_alsa_resume();
 	pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
 	ddvd_dream_aml_queue_paused = 0;
 	pthread_cond_broadcast(&ddvd_dream_aml_queue_cond);
@@ -1083,7 +1109,17 @@ static void ddvd_dream_aml_reset_decoder(void)
 	ddvd_dream_aml_reset_pacing();
 	/* A menu/cell hop also invalidates any partial AC-3 frame and queued PCM
 	 * from the previous cell.  Re-prepare ALSA without touching the decoder. */
-	ddvd_dream_alsa_reset();
+	if (ddvd_dream_audio_service) {
+		if (ioctl(ddvd_fdaudio, AUDIO_CLEAR_BUFFER) < 0)
+			Perror("AUDIO_CLEAR_BUFFER");
+		if (ioctl(ddvd_fdaudio, AUDIO_PLAY) < 0)
+			Perror("AUDIO_PLAY");
+		if (ioctl(ddvd_fdaudio, AUDIO_CONTINUE) < 0)
+			Perror("AUDIO_CONTINUE");
+		++ddvd_dream_audio_generation;
+	}
+	else
+		ddvd_dream_alsa_reset();
 	ddvd_dream_aml_backpressure_logged = 0;
 	if (ddvd_dream_aml_queued_output && ddvd_dream_aml_queue_start() < 0)
 		Debug(0, "Could not restart Dream Amlogic video queue\n");
@@ -1097,6 +1133,10 @@ static void ddvd_dream_aml_stop(void)
 	ddvd_dream_aml_queue_stop();
 	ddvd_dream_aml_queued_output = 0;
 	ddvd_dream_aml_reset_packet();
+	if (ddvd_dream_audio_service) {
+		ioctl(ddvd_fdaudio, AUDIO_STOP);
+		ioctl(ddvd_fdaudio, AUDIO_CLEAR_BUFFER);
+	}
 	ddvd_write_number(DDVD_DREAM_AML_DISABLE_VIDEO, 1);
 	if (ddvd_dream_aml_decoder_started) {
 		ioctl(ddvd_fdvideo, VIDEO_CLEAR_BUFFER);
@@ -1233,6 +1273,105 @@ static ssize_t ddvd_write_video_pes(const uint8_t *data, size_t size,
 static ssize_t ddvd_write_audio(const void *data, size_t size)
 {
 	return safe_write(ddvd_ac3_fd, data, size);
+}
+
+/* DVD LPCM as BCMA PCM, the form the dreamaudiod service takes PCM in: a
+ * WAVE format header ahead of big endian samples.  20 and 24 bit samples
+ * come in groups of two per channel, the upper 16 bits of all of them
+ * first, then the rest; they go out as plain 24 bit samples. */
+static int ddvd_write_lpcm_bcma(const uint8_t *pes)
+{
+	static uint8_t rest[8 * 2 * 3];
+	static size_t rest_size;
+	static uint8_t rest_info;
+	size_t header = 9 + pes[8];
+	size_t size = 6 + ((pes[4] << 8) | pes[5]);
+	const uint8_t *sub = pes + header;
+	const uint8_t *pcm;
+	unsigned int rate, channels, bits, block;
+	size_t pcm_size, group, out_size, payload, i;
+	uint8_t in[2 * 0xffff];
+	uint8_t out[6 + 0xffff];
+	uint8_t *samples;
+
+	if (size < header + 7)
+		return 0;
+	bits = (sub[5] >> 6) == 2 ? 24 : (sub[5] >> 6) == 1 ? 20 : 16;
+	if ((sub[5] >> 6) == 3)
+		return -1;
+	rate = (sub[5] & 0x30) == 0x10 ? 96000 : 48000;
+	channels = (sub[5] & 0x07) + 1;
+	pcm = sub + 7;
+	pcm_size = size - header - 7;
+	samples = out + header + 26;
+
+	if (bits == 16) {
+		out_size = pcm_size;
+		if (header + 26 + out_size > sizeof(out))
+			return -1;
+		memcpy(samples, pcm, pcm_size);
+	}
+	else {
+		/* a group can span two PES packets */
+		group = channels * (bits == 24 ? 6 : 5);
+		if (rest_info != sub[5])
+			rest_size = 0;
+		rest_info = sub[5];
+		if (rest_size + pcm_size > sizeof(in))
+			return -1;
+		memcpy(in, rest, rest_size);
+		memcpy(in + rest_size, pcm, pcm_size);
+		pcm_size += rest_size;
+		out_size = pcm_size / group * channels * 6;
+		if (header + 26 + out_size > sizeof(out))
+			return -1;
+		for (i = 0; i < pcm_size / group; i++) {
+			const uint8_t *g = in + i * group;
+			uint8_t *o = samples + i * channels * 6;
+			unsigned int n;
+
+			for (n = 0; n < channels * 2; n++) {
+				o[n * 3] = g[n * 2];
+				o[n * 3 + 1] = g[n * 2 + 1];
+				if (bits == 24)
+					o[n * 3 + 2] = g[channels * 4 + n];
+				else
+					o[n * 3 + 2] = n & 1 ? g[channels * 4 + n / 2] << 4 :
+						g[channels * 4 + n / 2] & 0xf0;
+			}
+		}
+		rest_size = pcm_size % group;
+		memcpy(rest, in + pcm_size - rest_size, rest_size);
+		bits = 24;
+	}
+
+	block = channels * bits / 8;
+	payload = header - 6 + 26 + out_size;
+	if (payload > 0xffff)
+		return -1;
+	memcpy(out, pes, header);
+	out[4] = payload >> 8;
+	out[5] = payload & 0xff;
+	memcpy(out + header, "BCMA\x12\x00\x00\x00", 8);
+	out[header + 8] = 0;	/* format tag 0: big endian */
+	out[header + 9] = 0;
+	out[header + 10] = channels;
+	out[header + 11] = 0;
+	out[header + 12] = rate & 0xff;
+	out[header + 13] = (rate >> 8) & 0xff;
+	out[header + 14] = (rate >> 16) & 0xff;
+	out[header + 15] = 0;
+	out[header + 16] = (rate * block) & 0xff;
+	out[header + 17] = ((rate * block) >> 8) & 0xff;
+	out[header + 18] = ((rate * block) >> 16) & 0xff;
+	out[header + 19] = 0;
+	out[header + 20] = block;
+	out[header + 21] = 0;
+	out[header + 22] = bits;
+	out[header + 23] = 0;
+	out[header + 24] = 0;
+	out[header + 25] = 0;
+	return safe_write(ddvd_ac3_fd, out, header + 26 + out_size) < 0 ? -1 : 0;
 }
 
 static int ddvd_has_dts_support(void)
@@ -2011,7 +2150,12 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 		goto err_open_fdvideo;
 	}
 
-	ddvd_ac3_fd = ddvd_fdaudio = open("/dev/dvb/adapter0/audio0", O_RDWR);
+	/* the audio decoder of the dreamaudiod service (Dream One/Two) */
+	ddvd_fdaudio = open("/dev/dvb/adapter0/dreamaudio0", O_RDWR);
+	ddvd_dream_audio_service = ddvd_fdaudio >= 0;
+	if (!ddvd_dream_audio_service)
+		ddvd_fdaudio = open("/dev/dvb/adapter0/audio0", O_RDWR);
+	ddvd_ac3_fd = ddvd_fdaudio;
 	if (ddvd_fdaudio == -1) {
 		Perror("/dev/dvb/adapter0/audio0");
 		res = DDVD_BUSY;
@@ -2109,7 +2253,7 @@ enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 	int ismute = 0;
 
 	if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
-		ddvd_dream_aml_active ? 0 : 1) < 0)
+		ddvd_dream_aml_active && !ddvd_dream_audio_service ? 0 : 1) < 0)
 		Perror("AUDIO_SET_AV_SYNC");
 #if CONFIG_API_VERSION == 1
 	// set video system
@@ -2548,7 +2692,7 @@ send_message:
 						if (audio_type != DDVD_MPEG) {
 							//Debug(1, "Switch to MPEG Audio\n");
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
-								ddvd_dream_aml_active ? 0 : 1) < 0)
+								ddvd_dream_aml_active && !ddvd_dream_audio_service ? 0 : 1) < 0)
 								Perror("AUDIO_SET_AV_SYNC");
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, 1) < 0)
 								Perror("AUDIO_SET_BYPASS_MODE");
@@ -2570,7 +2714,10 @@ send_message:
 					else if ((buf[14 + 3]) == 0xBD && (buf[14 + buf[14 + 8] + 9]) == 0xA0 + audio_id) {	// lpcm audio
 						// autodetect bypass mode
 						static int lpcm_mode = -1;
-						if (lpcm_mode < 0) {
+						/* the service tells the codec from the payload: MPEG audio */
+						if (ddvd_dream_audio_service)
+							lpcm_mode = 0;
+						else if (lpcm_mode < 0) {
 							lpcm_mode = 6;
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, lpcm_mode) < 0)
 								lpcm_mode = 0;
@@ -2579,7 +2726,7 @@ send_message:
 						if (audio_type != DDVD_LPCM) {
 							//Debug(1, "Switch to LPCM Audio\n");
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
-								ddvd_dream_aml_active ? 0 : 1) < 0)
+								ddvd_dream_aml_active && !ddvd_dream_audio_service ? 0 : 1) < 0)
 								Perror("AUDIO_SET_AV_SYNC");
 							if (ioctl(ddvd_fdaudio, AUDIO_SET_BYPASS_MODE, lpcm_mode) < 0)
 								Perror("AUDIO_SET_BYPASS_MODE");
@@ -2596,7 +2743,9 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-						if (lpcm_mode == 0) {
+						if (ddvd_dream_audio_service && ddvd_write_lpcm_bcma(buf + 14) == 0)
+							;	/* the service plays the samples as they are */
+						else if (lpcm_mode == 0) {
 							int i = 0;
 							char abuf[(((buf[18] << 8) | buf[19]) - buf[22] - 14)];
 #if BYTE_ORDER == BIG_ENDIAN
@@ -2654,7 +2803,7 @@ send_message:
 #endif
 							Debug(1, "Switch to DTS Audio id=%d stream=0x%02X bypass=%d\n",
 								audio_id, 0x88 + audio_id, dts_bypassmode);
-							if (!ddvd_dream_aml_active) {
+							if (!ddvd_dream_aml_active || ddvd_dream_audio_service) {
 								if (!ddvd_hisilicon_configure_audio(dts_bypassmode)) {
 									if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC, 1) < 0)
 										Perror("AUDIO_SET_AV_SYNC");
@@ -2675,7 +2824,7 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-						if (ddvd_dream_aml_active) {
+						if (ddvd_dream_aml_active && !ddvd_dream_audio_service) {
 							int raw_dts_size = ((buf[18] << 8) | buf[19]) -
 								buf[22] - 7;
 
@@ -2701,7 +2850,7 @@ send_message:
 					else if ((buf[14 + 3]) == 0xBD && (buf[14 + buf[14 + 8] + 9]) == 0x80 + audio_id) {	// ac3 audio
 						if (audio_type != DDVD_AC3) {
 							//Debug(1, "Switch to AC3 Audio\n");
-							if (!ddvd_dream_aml_active) {
+							if (!ddvd_dream_aml_active || ddvd_dream_audio_service) {
 								int bypassmode;
 #ifdef CONVERT_TO_DVB_COMPLIANT_AC3
 								bypassmode = 0;
@@ -2728,7 +2877,7 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-						if (ddvd_dream_aml_active) {
+						if (ddvd_dream_aml_active && !ddvd_dream_audio_service) {
 							int raw_ac3_size = ((buf[18] << 8) | buf[19]) -
 								buf[22] - 7;
 
@@ -4245,7 +4394,7 @@ static void ddvd_device_clear(void)
 	}
 
 	if (ioctl(ddvd_fdaudio, AUDIO_SET_AV_SYNC,
-		ddvd_dream_aml_active ? 0 : 1) < 0)
+		ddvd_dream_aml_active && !ddvd_dream_audio_service ? 0 : 1) < 0)
 		Perror("AUDIO_SET_AV_SYNC");
 }
 
