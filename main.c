@@ -171,6 +171,10 @@ static unsigned int ddvd_dream_audio_generation;
 #define DDVD_DREAM_AML_TSYNC_ENABLE      "/sys/class/tsync/enable"
 #define DDVD_DREAM_DEFAULT_FRAME_PTS      UINT64_C(3600)
 #define DDVD_DREAM_BACKPRESSURE_MS        500
+/* with tsync the decoder holds pictures until their PTS is due and takes no
+ * data meanwhile: wait for it like for a full buffer */
+#define DDVD_DREAM_SYNC_BACKPRESSURE_MS   5000
+#define DDVD_DREAM_BACKPRESSURE_LIMIT 	(ddvd_dream_audio_service ? DDVD_DREAM_SYNC_BACKPRESSURE_MS : 	DDVD_DREAM_BACKPRESSURE_MS)
 #define DDVD_DREAM_MPEG2_PACKET_MAX_SIZE (2 * 1024 * 1024)
 #define DDVD_DREAM_VIDEO_QUEUE_FRAMES     32
 
@@ -198,6 +202,7 @@ struct ddvd_dream_video_packet {
 	uint8_t *data;
 	size_t size;
 	uint64_t pts;
+	uint64_t est;
 	struct ddvd_dream_video_packet *next;
 };
 
@@ -251,15 +256,59 @@ static int ddvd_dream_aml_queue_stop_requested;
 static int ddvd_dream_aml_queue_paused;
 static int ddvd_dream_aml_queue_failed;
 
+/*
+ * With the dreamaudiod service the kernel syncs: tsync presents the video by
+ * its PTS and runs the clock, the audio follows the clock by its PTS.  Both
+ * go on one timeline, the DVD PTS plus an offset.  A cell can restart the
+ * DVD clock; the stream that sees the jump first opens a new segment with a
+ * new offset, the other stream takes the same offset at its own jump.  After
+ * a clear the next picture is anchored just ahead of the running clock.
+ */
+#define DDVD_DREAM_JUMP_PTS      90000
+#define DDVD_DREAM_ANCHOR_PTS    27000
+#define DDVD_DREAM_LEAD_PTS      90000
+#define DDVD_DREAM_SEGMENTS      8
+#define DDVD_DREAM_PENDING_PTS   8
+
+struct ddvd_dream_map {
+	int valid;
+	unsigned int segment;
+	uint64_t last;
+};
+
+static int ddvd_dream_anchored;
+/* after a clear the timeline goes on where the dropped pictures were */
+static int ddvd_dream_rebase;
+static uint64_t ddvd_dream_rebase_pts;
+static unsigned int ddvd_dream_segment;
+static int64_t ddvd_dream_offsets[DDVD_DREAM_SEGMENTS];
+static struct ddvd_dream_map ddvd_dream_map_video;
+static struct ddvd_dream_map ddvd_dream_map_audio;
+
+/* PES timestamps waiting for the first picture that starts in their PES */
+static struct {
+	size_t offset;
+	uint64_t pts;
+} ddvd_dream_pending[DDVD_DREAM_PENDING_PTS];
+static unsigned int ddvd_dream_pending_count;
+
+/* a picture without a PTS of its own: the GOP base plus its temporal
+ * reference, in display order */
+static int ddvd_dream_gop_valid;
+static uint64_t ddvd_dream_gop_base;
+static unsigned int ddvd_dream_gop_frames;
+
 static int ddvd_write_number(const char *filename, int value);
 static int ddvd_dream_aml_queue_start(void);
 static void ddvd_dream_aml_queue_stop(void);
 static int ddvd_dream_aml_queue_packet(const uint8_t *data, size_t size,
-	uint64_t pts);
+	uint64_t pts, uint64_t est);
 
 static void ddvd_dream_aml_reset_packet(void)
 {
 	ddvd_dream_aml_packet_size = 0;
+	ddvd_dream_pending_count = 0;
+	ddvd_dream_gop_valid = 0;
 }
 
 static void ddvd_dream_aml_free_packet(void)
@@ -334,6 +383,129 @@ static int ddvd_dream_audio_clock(int64_t *pts, unsigned int *generation)
 	*pts = (int64_t)(played & UINT64_C(0x1ffffffff));
 	*generation = ddvd_dream_audio_generation;
 	return 1;
+}
+
+/* the running clock, 0 while no picture is shown */
+static uint32_t ddvd_dream_clock(void)
+{
+	unsigned long long shown = 0;
+	char text[32];
+
+	if (ioctl(ddvd_fdvideo, VIDEO_GET_PTS, &shown) < 0 || !shown ||
+		read_string("/sys/class/tsync/pts_pcrscr", text, sizeof(text)) < 0)
+		return 0;
+	return (uint32_t)strtoul(text, NULL, 16);
+}
+
+static void ddvd_dream_map_reset(void)
+{
+	ddvd_dream_anchored = 0;
+	ddvd_dream_rebase = 0;
+	ddvd_dream_map_video.valid = 0;
+	ddvd_dream_map_audio.valid = 0;
+	ddvd_dream_pending_count = 0;
+}
+
+/* the decoder PTS of a DVD PTS; 0 for audio ahead of the first picture */
+static uint64_t ddvd_dream_map_pts(struct ddvd_dream_map *map, uint64_t pts)
+{
+	uint64_t mapped;
+
+	if (!ddvd_dream_anchored) {
+		uint32_t clock;
+
+		if (map != &ddvd_dream_map_video)
+			return 0;
+		clock = ddvd_dream_clock();
+		ddvd_dream_anchored = 1;
+		ddvd_dream_segment = 0;
+		ddvd_dream_offsets[0] = clock ?
+			(int64_t)clock + DDVD_DREAM_ANCHOR_PTS - (int64_t)pts : 0;
+		Debug(2, "Dream timeline anchored (clock %u, DVD PTS %llu)\n",
+			clock, (unsigned long long)pts);
+		ddvd_dream_map_audio.valid = 0;
+	}
+	if (ddvd_dream_rebase) {
+		uint32_t clock;
+		uint64_t target = ddvd_dream_rebase_pts;
+
+		if (map != &ddvd_dream_map_video)
+			return 0;
+		/* The clock ran on during a still picture: set it back.  A jump
+		 * of the pictures instead makes the decoder hold them as a
+		 * discontinuity. */
+		clock = ddvd_dream_clock();
+		if (clock && (int32_t)((uint32_t)target - clock) < DDVD_DREAM_ANCHOR_PTS) {
+			char text[16];
+
+			snprintf(text, sizeof(text), "0x%x",
+				(uint32_t)(target - DDVD_DREAM_ANCHOR_PTS));
+			write_string("/sys/class/tsync/pts_pcrscr", text);
+		}
+		ddvd_dream_offsets[(ddvd_dream_segment + 1) % DDVD_DREAM_SEGMENTS] =
+			(int64_t)target - (int64_t)pts;
+		++ddvd_dream_segment;
+		ddvd_dream_rebase = 0;
+		Debug(2, "Dream timeline goes on at %llu (clock %u, DVD PTS %llu)\n",
+			(unsigned long long)target, clock, (unsigned long long)pts);
+		map->valid = 0;
+		ddvd_dream_map_audio.valid = 0;
+	}
+	if (!map->valid) {
+		map->valid = 1;
+		map->segment = ddvd_dream_segment;
+	}
+	else {
+		/* 33 bit difference, sign extended */
+		int64_t step = (int64_t)((pts - map->last) << 31) >> 31;
+
+		if (step > DDVD_DREAM_JUMP_PTS || step < -DDVD_DREAM_JUMP_PTS / 2) {
+			if (map->segment != ddvd_dream_segment)
+				++map->segment;
+			else {
+				ddvd_dream_offsets[(map->segment + 1) % DDVD_DREAM_SEGMENTS] =
+					ddvd_dream_offsets[map->segment % DDVD_DREAM_SEGMENTS] - step;
+				map->segment = ++ddvd_dream_segment;
+			}
+			if (map == &ddvd_dream_map_video)
+				ddvd_dream_gop_valid = 0;
+			Debug(2, "Dream %s PTS jump %lld, segment %u\n",
+				map == &ddvd_dream_map_video ? "video" : "audio",
+				(long long)step, map->segment);
+		}
+	}
+	map->last = pts;
+	mapped = (uint64_t)((int64_t)pts +
+		ddvd_dream_offsets[map->segment % DDVD_DREAM_SEGMENTS]) & UINT64_C(0x1ffffffff);
+	return mapped ? mapped : 1;
+}
+
+/* Feed at most DDVD_DREAM_LEAD_PTS ahead of the clock: the driver drops
+ * frames after a write timeout. */
+static int ddvd_dream_aml_lead(uint64_t est)
+{
+	for (;;) {
+		int interrupted;
+		int32_t lead;
+		uint32_t clock;
+
+		pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
+		while (!ddvd_dream_aml_queue_stop_requested &&
+			ddvd_dream_aml_queue_paused)
+			pthread_cond_wait(&ddvd_dream_aml_queue_cond,
+				&ddvd_dream_aml_queue_mutex);
+		interrupted = ddvd_dream_aml_queue_stop_requested;
+		pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
+		if (interrupted)
+			return 0;
+		clock = ddvd_dream_clock();
+		if (!clock)
+			return 1;
+		lead = (int32_t)((uint32_t)est - clock);
+		if (lead <= DDVD_DREAM_LEAD_PTS || lead > 10 * 90000)
+			return 1;
+		usleep(10000);
+	}
 }
 
 static int64_t ddvd_dream_aml_sync_feedback(uint64_t now, int64_t frame_us)
@@ -446,6 +618,14 @@ static uint64_t ddvd_dream_aml_logical_pts(uint64_t dvd_pts,
 	if (!ddvd_dream_aml_active || dvd_pts == 0)
 		return decoder_pts;
 
+	if (ddvd_dream_audio_service) {
+		if (!ddvd_dream_anchored || !decoder_pts)
+			return dvd_pts;
+		return (uint64_t)((int64_t)decoder_pts - ddvd_dream_offsets[
+			ddvd_dream_map_video.segment % DDVD_DREAM_SEGMENTS]) &
+			UINT64_C(0x1ffffffff);
+	}
+
 	/* The decoder runs on the private continuous timeline while SPU/button and
 	 * dvdnav logic still use the original DVD clock.  Translate the displayed
 	 * position by subtracting the number of frames currently queued ahead. */
@@ -461,6 +641,15 @@ static void ddvd_dream_aml_resume_clock(void)
 {
 	if (!ddvd_dream_aml_active)
 		return;
+
+	if (ddvd_dream_audio_service) {
+		/* the kernel syncs: tsync presents the video and runs the clock */
+		ddvd_write_number(DDVD_DREAM_AML_TSYNC_ENABLE, 1);
+		ddvd_write_number(DDVD_DREAM_AML_FREERUN_MODE, 0);
+		ddvd_dream_aml_av_clock = 1;
+		ddvd_dream_aml_backpressure_logged = 0;
+		return;
+	}
 
 	/* ALSA does not feed the vendor DVB APTS/PCR clock. Enabling tsync with
 	 * that missing clock can freeze a menu or the first movie frame. Keep
@@ -602,9 +791,12 @@ static int ddvd_dream_aml_prepare(const char *dvd_path)
 
 	ddvd_dream_aml_active = 1;
 	ddvd_dream_aml_set_vfm_route();
+	ddvd_dream_map_reset();
 	if (ddvd_write_number(DDVD_DREAM_AML_DISABLE_VIDEO, 1) < 0 ||
-		ddvd_write_number(DDVD_DREAM_AML_TSYNC_ENABLE, 0) < 0 ||
-		ddvd_write_number(DDVD_DREAM_AML_FREERUN_MODE, 1) < 0) {
+		ddvd_write_number(DDVD_DREAM_AML_TSYNC_ENABLE,
+			ddvd_dream_audio_service) < 0 ||
+		ddvd_write_number(DDVD_DREAM_AML_FREERUN_MODE,
+			!ddvd_dream_audio_service) < 0) {
 		Debug(0, "Could not configure Dream Amlogic decoder state\n");
 		ddvd_dream_aml_restore();
 		return -1;
@@ -714,7 +906,7 @@ static int ddvd_dream_aml_start_decoder(const uint8_t *data, size_t size)
 
 static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 	size_t size,
-	uint64_t pts)
+	uint64_t pts, uint64_t est)
 {
 	struct ddvd_dream_video_frame frame;
 	struct pollfd descriptors[2];
@@ -737,7 +929,8 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 			return -1;
 	}
 
-	if (!ddvd_dream_aml_pace(pts))
+	if (ddvd_dream_audio_service ? !ddvd_dream_aml_lead(est) :
+		!ddvd_dream_aml_pace(pts))
 		return 0;
 	memset(&frame, 0, sizeof(frame));
 	/* The normalized timestamp gives Amlogic a proper presentation anchor for
@@ -749,6 +942,16 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 		int count;
 
 		memset(descriptors, 0, sizeof(descriptors));
+		if (backpressure_since) {
+			int interrupted;
+
+			/* a stop must not wait out the backpressure */
+			pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
+			interrupted = ddvd_dream_aml_queue_stop_requested;
+			pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
+			if (interrupted)
+				return (ssize_t)written;
+		}
 		descriptors[0].fd = ddvd_fdvideo;
 		descriptors[0].events = POLLOUT | POLLPRI;
 		descriptors[1].fd = ddvd_dream_aml_poll_fd;
@@ -771,7 +974,7 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 			if (!backpressure_since)
 				backpressure_since = ddvd_get_time();
 			if (ddvd_get_time() - backpressure_since >=
-				DDVD_DREAM_BACKPRESSURE_MS)
+				DDVD_DREAM_BACKPRESSURE_LIMIT)
 				goto backpressure_timeout;
 			continue;
 		}
@@ -786,7 +989,7 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 				if (!backpressure_since)
 					backpressure_since = ddvd_get_time();
 				if (ddvd_get_time() - backpressure_since >=
-					DDVD_DREAM_BACKPRESSURE_MS)
+					DDVD_DREAM_BACKPRESSURE_LIMIT)
 					goto backpressure_timeout;
 				usleep(1000);
 				continue;
@@ -800,7 +1003,7 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 			if (!backpressure_since)
 				backpressure_since = ddvd_get_time();
 			if (ddvd_get_time() - backpressure_since >=
-				DDVD_DREAM_BACKPRESSURE_MS)
+				DDVD_DREAM_BACKPRESSURE_LIMIT)
 				goto backpressure_timeout;
 			usleep(1000);
 			continue;
@@ -825,7 +1028,7 @@ static ssize_t ddvd_dream_aml_submit_packet(const uint8_t *data,
 backpressure_timeout:
 	if (!ddvd_dream_aml_backpressure_logged) {
 		Debug(0, "Dream video backpressure did not clear within %d ms\n",
-			DDVD_DREAM_BACKPRESSURE_MS);
+			DDVD_DREAM_BACKPRESSURE_LIMIT);
 		ddvd_dream_aml_backpressure_logged = 1;
 	}
 	return written ? (ssize_t)written : -1;
@@ -839,7 +1042,7 @@ static void ddvd_dream_aml_queue_clear_locked(void)
 	 * gap equal to the complete queue depth (33 frames in the observed case),
 	 * which Amlogic treats as a discontinuity and leaves the menu frame shown. */
 	if (ddvd_dream_aml_queue_head != NULL)
-		ddvd_dream_aml_output_pts = ddvd_dream_aml_queue_head->pts;
+		ddvd_dream_aml_output_pts = ddvd_dream_aml_queue_head->est;
 	while (ddvd_dream_aml_queue_head != NULL) {
 		struct ddvd_dream_video_packet *packet =
 			ddvd_dream_aml_queue_head;
@@ -879,7 +1082,7 @@ static void *ddvd_dream_aml_queue_worker(void *unused)
 		pthread_mutex_unlock(&ddvd_dream_aml_queue_mutex);
 
 		result = ddvd_dream_aml_submit_packet(packet->data,
-			packet->size, packet->pts);
+			packet->size, packet->pts, packet->est);
 		if (result == 0) {
 			/* Stop interrupted pacing before this picture was submitted.
 			 * Return it to the head so queue_clear reuses its PTS at the
@@ -950,7 +1153,7 @@ static void ddvd_dream_aml_queue_stop(void)
 }
 
 static int ddvd_dream_aml_queue_packet(const uint8_t *data, size_t size,
-	uint64_t pts)
+	uint64_t pts, uint64_t est)
 {
 	struct ddvd_dream_video_packet *packet;
 
@@ -965,6 +1168,7 @@ static int ddvd_dream_aml_queue_packet(const uint8_t *data, size_t size,
 	memcpy(packet->data, data, size);
 	packet->size = size;
 	packet->pts = pts;
+	packet->est = est;
 	packet->next = NULL;
 
 	pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
@@ -1024,6 +1228,8 @@ static void ddvd_dream_aml_resume_output(void)
  * between two sparse DVD PES timestamps creates 0.5--1.2 second bursts and a
  * large PTS step can permanently stop amvdec_mpeg12.  Split at MPEG picture
  * start codes and give every picture a continuous frame-rate-derived PTS.
+ * With the dreamaudiod service a picture carries the PTS of its PES on the
+ * shared timeline instead, the frame-rate-derived one only paces the queue.
  */
 static ssize_t ddvd_dream_aml_write_es(const uint8_t *data, size_t size,
 	uint64_t pts)
@@ -1031,10 +1237,19 @@ static ssize_t ddvd_dream_aml_write_es(const uint8_t *data, size_t size,
 	size_t input_size = size;
 	ssize_t result = 0;
 
-	(void)pts;
-
 	if (size == 0)
 		return 0;
+
+	if (ddvd_dream_audio_service && pts != UINT64_MAX) {
+		if (ddvd_dream_pending_count == DDVD_DREAM_PENDING_PTS) {
+			memmove(ddvd_dream_pending, ddvd_dream_pending + 1,
+				sizeof(ddvd_dream_pending[0]) * --ddvd_dream_pending_count);
+		}
+		ddvd_dream_pending[ddvd_dream_pending_count].offset =
+			ddvd_dream_aml_packet_size;
+		ddvd_dream_pending[ddvd_dream_pending_count++].pts =
+			ddvd_dream_map_pts(&ddvd_dream_map_video, pts);
+	}
 
 	if (size > DDVD_DREAM_MPEG2_PACKET_MAX_SIZE -
 		ddvd_dream_aml_packet_size) {
@@ -1073,14 +1288,61 @@ static ssize_t ddvd_dream_aml_write_es(const uint8_t *data, size_t size,
 			ddvd_dream_aml_frame_pts_step4 =
 				ddvd_dream_aml_frame_pts_duration4(sequence[7] & 0x0f);
 
+		/* the decoder PTS: the frame-rate-derived one, or with the service
+		 * the PTS of the PES the picture starts in, else none */
+		uint64_t picture_pts = ddvd_dream_aml_output_pts;
+
+		if (ddvd_dream_audio_service) {
+			unsigned int i, used = 0;
+
+			picture_pts = 0;
+			for (i = 0; i < ddvd_dream_pending_count &&
+				ddvd_dream_pending[i].offset <= first_picture; ++i) {
+				picture_pts = ddvd_dream_pending[i].pts;
+				used = i + 1;
+			}
+			ddvd_dream_pending_count -= used;
+			memmove(ddvd_dream_pending, ddvd_dream_pending + used,
+				sizeof(ddvd_dream_pending[0]) * ddvd_dream_pending_count);
+			for (i = 0; i < ddvd_dream_pending_count; ++i)
+				ddvd_dream_pending[i].offset =
+					ddvd_dream_pending[i].offset > next_picture ?
+					ddvd_dream_pending[i].offset - next_picture : 0;
+			const uint8_t *picture = ddvd_dream_aml_packet_data + first_picture;
+			unsigned int reference = (picture[4] << 2) | (picture[5] >> 6);
+
+			if (ddvd_find_mpeg_start_code(ddvd_dream_aml_packet_data,
+				first_picture + 3, 0xb8) != NULL) {
+				if (ddvd_dream_gop_valid)
+					ddvd_dream_gop_base += ddvd_dream_gop_frames *
+						ddvd_dream_aml_frame_pts_step4 / 4;
+				ddvd_dream_gop_frames = 0;
+			}
+			if (picture_pts) {
+				ddvd_dream_gop_base = picture_pts -
+					reference * ddvd_dream_aml_frame_pts_step4 / 4;
+				ddvd_dream_gop_valid = 1;
+			}
+			else if (ddvd_dream_gop_valid)
+				picture_pts = (ddvd_dream_gop_base + reference *
+					ddvd_dream_aml_frame_pts_step4 / 4) & UINT64_C(0x1ffffffff);
+			else
+				picture_pts = ddvd_dream_aml_output_pts;
+			if (!picture_pts)
+				picture_pts = 1;
+			if (reference + 1 > ddvd_dream_gop_frames)
+				ddvd_dream_gop_frames = reference + 1;
+			ddvd_dream_aml_output_pts = picture_pts;
+		}
+
 		if (ddvd_dream_aml_queued_output)
 			result = ddvd_dream_aml_queue_packet(
 				ddvd_dream_aml_packet_data, next_picture,
-				ddvd_dream_aml_output_pts);
+				picture_pts, ddvd_dream_aml_output_pts);
 		else
 			result = ddvd_dream_aml_submit_packet(
 				ddvd_dream_aml_packet_data, next_picture,
-				ddvd_dream_aml_output_pts);
+				picture_pts, ddvd_dream_aml_output_pts);
 		if (result < 0)
 			return -1;
 		ddvd_dream_aml_frame_pts_remainder += ddvd_dream_aml_frame_pts_step4;
@@ -1107,6 +1369,10 @@ static void ddvd_dream_aml_reset_decoder(void)
 	ddvd_dream_aml_queue_stop();
 	ddvd_dream_aml_reset_packet();
 	ddvd_dream_aml_reset_pacing();
+	if (ddvd_dream_anchored) {
+		ddvd_dream_rebase = 1;
+		ddvd_dream_rebase_pts = ddvd_dream_aml_output_pts;
+	}
 	/* A menu/cell hop also invalidates any partial AC-3 frame and queued PCM
 	 * from the previous cell.  Re-prepare ALSA without touching the decoder. */
 	if (ddvd_dream_audio_service) {
@@ -1151,6 +1417,7 @@ static void ddvd_dream_aml_stop(void)
 	}
 	ddvd_dream_aml_decoder_started = 0;
 	ddvd_dream_aml_reset_pacing();
+	ddvd_dream_map_reset();
 }
 
 #else
@@ -1273,6 +1540,34 @@ static ssize_t ddvd_write_video_pes(const uint8_t *data, size_t size,
 static ssize_t ddvd_write_audio(const void *data, size_t size)
 {
 	return safe_write(ddvd_ac3_fd, data, size);
+}
+
+/* the audio PES on the timeline of the video; 0 drops it, it comes ahead of
+ * the first picture */
+static int ddvd_dream_audio_pes(uint8_t *pes)
+{
+#if CONFIG_API_VERSION == 3 && defined(__aarch64__)
+	uint64_t pts;
+
+	if (!ddvd_dream_audio_service || !ddvd_dream_aml_active)
+		return 1;
+	if (!(pes[7] & 0x80))
+		return ddvd_dream_anchored && !ddvd_dream_rebase;
+	pts = ((uint64_t)((pes[9] >> 1) & 7) << 30) | ((uint64_t)pes[10] << 22) |
+		((uint64_t)(pes[11] >> 1) << 15) | ((uint64_t)pes[12] << 7) |
+		(pes[13] >> 1);
+	pts = ddvd_dream_map_pts(&ddvd_dream_map_audio, pts);
+	if (!pts)
+		return 0;
+	pes[9] = (pes[9] & 0xf1) | ((pts >> 29) & 0x0e);
+	pes[10] = pts >> 22;
+	pes[11] = ((pts >> 14) & 0xfe) | 1;
+	pes[12] = pts >> 7;
+	pes[13] = ((pts << 1) & 0xfe) | 1;
+#else
+	(void)pes;
+#endif
+	return 1;
 }
 
 /* DVD LPCM as BCMA PCM, the form the dreamaudiod service takes PCM in: a
@@ -1993,8 +2288,11 @@ static int readApiFrameRate(int fd, int *framerate)
 enum ddvd_result ddvd_run(struct ddvd *playerconfig)
 {
 	{	char * DL = getenv("LIBDVD_DEBUG");
-		if (DL)
+		if (DL) {
 			DebugLevel = atoi(DL);
+			/* the debug lines must not wait in a full buffer */
+			setvbuf(stdout, NULL, _IOLBF, 0);
+		}
 	}
 
 	if (playerconfig->lfb == NULL) {
@@ -2709,7 +3007,8 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-						ddvd_write_audio(buf + 14, buf[19] + (buf[18] << 8) + 6);
+						if (ddvd_dream_audio_pes(buf + 14))
+							ddvd_write_audio(buf + 14, buf[19] + (buf[18] << 8) + 6);
 					}
 					else if ((buf[14 + 3]) == 0xBD && (buf[14 + buf[14 + 8] + 9]) == 0xA0 + audio_id) {	// lpcm audio
 						// autodetect bypass mode
@@ -2743,7 +3042,8 @@ send_message:
 							//Debug(1, "APTS=%X\n",(int)apts);
 						}
 
-						if (ddvd_dream_audio_service && ddvd_write_lpcm_bcma(buf + 14) == 0)
+						if (ddvd_dream_audio_service && (!ddvd_dream_audio_pes(buf + 14) ||
+							ddvd_write_lpcm_bcma(buf + 14) == 0))
 							;	/* the service plays the samples as they are */
 						else if (lpcm_mode == 0) {
 							int i = 0;
@@ -2833,7 +3133,7 @@ send_message:
 									buf + buf[22] + 27,
 									(size_t)raw_dts_size, apts);
 						}
-						else {
+						else if (ddvd_dream_audio_pes(buf + 14)) {
 #ifdef CONVERT_TO_DVB_COMPLIANT_DTS
 							unsigned short pes_len = (buf[14 + 4] << 8 | buf[14 + 5]);
 							pes_len -= 4;	// strip first 4 bytes of pes payload
@@ -2886,7 +3186,7 @@ send_message:
 									buf + buf[22] + 27,
 									(size_t)raw_ac3_size, apts);
 						}
-						else {
+						else if (ddvd_dream_audio_pes(buf + 14)) {
 #ifdef CONVERT_TO_DVB_COMPLIANT_AC3
 							unsigned short pes_len = (buf[14 + 4] << 8 | buf[14 + 5]);
 							pes_len -= 4;	// strip first 4 bytes of pes payload
@@ -3162,9 +3462,15 @@ send_message:
 					if (playerconfig->should_resume && next_cell_change) {
 						if (dvdnav_sector_search(dvdnav, playerconfig->resume_block, SEEK_SET) == DVDNAV_STATUS_OK) {
 							Debug(3, "    resuming to block %lu\n", playerconfig->resume_block);
-							audio_id = playerconfig->resume_audio_id;
+							/* a short resume file leaves garbage in the stream ids */
+							if (playerconfig->resume_audio_id >= 0 &&
+								playerconfig->resume_audio_id < MAX_AUDIO &&
+								playerconfig->audio_format[playerconfig->resume_audio_id] != -1)
+								audio_id = playerconfig->resume_audio_id;
 							audio_lock = 1;//playerconfig->resume_audio_lock;
-							spu_active_id = playerconfig->resume_spu_id;
+							if (playerconfig->resume_spu_id >= -1 &&
+								playerconfig->resume_spu_id < 32)
+								spu_active_id = playerconfig->resume_spu_id;
 							spu_lock = 1;//playerconfig->resume_spu_lock;
 							report_audio_info = 1;
 							uint16_t spu_lang = 0xFFFF;
@@ -3359,6 +3665,12 @@ send_message:
 		else if (ioctl(ddvd_fdvideo, VIDEO_GET_PTS, &pts) < 0)
 			Perror("VIDEO_GET_PTS");
 		pts = ddvd_dream_aml_logical_pts(vpts, pts);
+		/* the PTS of a still menu picture stands: its buttons come a little
+		 * later and would never be due */
+		if (ddvd_dream_aml_active && ddvd_spu_play < ddvd_spu_ind && pts < spupts &&
+			(ddvd_still_frame || ddvd_wait_highlight || ddvd_wait_for_user ||
+			 dvdnav_is_domain_vmgm(dvdnav) || dvdnav_is_domain_vtsm(dvdnav)))
+			pts = spupts;
 		// pts+10 to avoid decoder time rounding errors. Seen vpts=11555 and pts=11554 ...
 		signed long long spudiff = pts+10 - spupts;
 #endif
