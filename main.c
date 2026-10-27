@@ -267,6 +267,8 @@ static int ddvd_dream_aml_queue_failed;
 #define DDVD_DREAM_JUMP_PTS      90000
 #define DDVD_DREAM_ANCHOR_PTS    27000
 #define DDVD_DREAM_LEAD_PTS      90000
+/* the clock stood this long while the pictures waited for it */
+#define DDVD_DREAM_CLOCK_STALL_MS 200
 #define DDVD_DREAM_SEGMENTS      8
 #define DDVD_DREAM_PENDING_PTS   8
 
@@ -481,15 +483,22 @@ static uint64_t ddvd_dream_map_pts(struct ddvd_dream_map *map, uint64_t pts)
 }
 
 /* Feed at most DDVD_DREAM_LEAD_PTS ahead of the clock: the driver drops
- * frames after a write timeout. */
+ * frames after a write timeout.  The clock of a player follows its audio;
+ * when it stands, waiting holds back the audio as well and the clock never
+ * moves again, so feed on. */
 static int ddvd_dream_aml_lead(uint64_t est)
 {
+	uint32_t last_clock = 0;
+	uint64_t clock_since = 0;
+
 	for (;;) {
 		int interrupted;
+		int paused;
 		int32_t lead;
 		uint32_t clock;
 
 		pthread_mutex_lock(&ddvd_dream_aml_queue_mutex);
+		paused = ddvd_dream_aml_queue_paused;
 		while (!ddvd_dream_aml_queue_stop_requested &&
 			ddvd_dream_aml_queue_paused)
 			pthread_cond_wait(&ddvd_dream_aml_queue_cond,
@@ -504,6 +513,15 @@ static int ddvd_dream_aml_lead(uint64_t est)
 		lead = (int32_t)((uint32_t)est - clock);
 		if (lead <= DDVD_DREAM_LEAD_PTS || lead > 10 * 90000)
 			return 1;
+		if (paused || clock != last_clock || !clock_since) {
+			last_clock = clock;
+			clock_since = ddvd_get_time();
+		}
+		else if (ddvd_get_time() - clock_since >= DDVD_DREAM_CLOCK_STALL_MS) {
+			Debug(1, "Dream clock stands at %u, %d ms ahead: feeding on\n",
+				clock, lead / 90);
+			return 1;
+		}
 		usleep(10000);
 	}
 }
